@@ -9,7 +9,9 @@ export async function GET(req: NextRequest) {
   if (req.method === 'GET') {
     try {
 
-      const limit = await (await sunoApi((await cookies()).toString())).get_credits();
+      const customCookie = req.headers.get('x-suno-cookie');
+      const cookieStr = customCookie || (await cookies()).toString();
+      const limit = await (await sunoApi(cookieStr)).get_credits();
 
 
       return new NextResponse(JSON.stringify(limit), {

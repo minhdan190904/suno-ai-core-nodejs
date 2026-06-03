@@ -352,7 +352,7 @@ export default function StudioPage() {
           <div className="text-center py-20 text-white/20">
             <div className="text-6xl mb-4">🎼</div>
             <p className="text-lg">Chưa có bài hát nào</p>
-            <p className="text-sm mt-1">Nhập mô tả và nhấn "Tạo bài hát" để bắt đầu!</p>
+            <p className="text-sm mt-1">Nhập mô tả và nhấn &ldquo;Tạo bài hát&rdquo; để bắt đầu!</p>
           </div>
         )}
       </div>

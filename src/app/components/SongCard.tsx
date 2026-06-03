@@ -110,14 +110,7 @@ export default function SongCard({ song }: { song: Song }) {
         {/* Thumbnail */}
         <div className="w-20 h-20 flex-shrink-0 rounded-xl overflow-hidden bg-gradient-to-br from-indigo-600 to-purple-700 flex items-center justify-center">
           {song.image_url ? (
-            <img
-              src={song.image_url}
-              alt={song.title}
-              className="w-full h-full object-cover"
-              crossOrigin="anonymous"
-              loading="lazy"
-              onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }}
-            />
+            <img src={song.image_url} alt={song.title} className="w-full h-full object-cover" />
           ) : (
             <svg className="w-8 h-8 text-white/30" fill="currentColor" viewBox="0 0 24 24">
               <path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"/>

@@ -260,21 +260,124 @@ class SunoApi {
       '--disable-web-security',
       '--no-sandbox',
       '--disable-dev-shm-usage',
-      '--disable-features=site-per-process',
-      '--disable-features=IsolateOrigins',
+      // Combine into one --disable-features (Chrome only reads the last one)
+      '--disable-features=site-per-process,IsolateOrigins,CrossOriginEmbedderPolicy,CrossOriginOpenerPolicy',
       '--disable-extensions',
-      '--disable-infobars'
+      '--disable-infobars',
+      '--disable-component-extensions-with-background-pages',
+      '--disable-default-apps',
+      '--disable-hang-monitor',
+      '--disable-ipc-flooding-protection',
+      '--disable-popup-blocking',
+      '--disable-prompt-on-repost',
+      '--disable-renderer-backgrounding',
+      '--disable-sync',
+      '--metrics-recording-only',
+      '--no-first-run',
+      '--password-store=basic',
+      '--use-mock-keychain',
+      '--force-color-profile=srgb',
+      '--window-size=1920,1080',
     ];
     // Check for GPU acceleration, as it is recommended to turn it off for Docker
     if (yn(process.env.BROWSER_DISABLE_GPU, { default: false }))
       args.push('--enable-unsafe-swiftshader',
         '--disable-gpu',
         '--disable-setuid-sandbox');
+
+    logger.info('[launchBrowser] Launching browser (headless=' + yn(process.env.BROWSER_HEADLESS, { default: true }) + ')');
     const browser = await this.getBrowserType().launch({
       args,
       headless: yn(process.env.BROWSER_HEADLESS, { default: true })
     });
-    const context = await browser.newContext({ userAgent: this.userAgent, locale: process.env.BROWSER_LOCALE, viewport: null });
+    logger.info('[launchBrowser] Browser launched successfully');
+
+    const context = await browser.newContext({
+      userAgent: this.userAgent,
+      locale: process.env.BROWSER_LOCALE,
+      viewport: { width: 1920, height: 1080 },
+      screen: { width: 1920, height: 1080 },
+      deviceScaleFactor: 1,
+    });
+    logger.info('[launchBrowser] Browser context created. userAgent=' + this.userAgent);
+
+    // Inject anti-detection scripts before any page loads (runs in every frame including hCaptcha iframe)
+    await context.addInitScript(`
+      // Hide navigator.webdriver (primary headless detection vector)
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+
+      // Override navigator.userAgentData to hide HeadlessChrome
+      if (navigator.userAgentData) {
+        Object.defineProperty(navigator, 'userAgentData', {
+          get: () => ({
+            brands: [
+              { brand: 'Google Chrome', version: '131' },
+              { brand: 'Chromium', version: '131' },
+              { brand: 'Not_A Brand', version: '24' },
+            ],
+            mobile: false,
+            platform: 'macOS',
+            getHighEntropyValues: (hints) => Promise.resolve({
+              brands: [
+                { brand: 'Google Chrome', version: '131' },
+                { brand: 'Chromium', version: '131' },
+                { brand: 'Not_A Brand', version: '24' },
+              ],
+              fullVersionList: [
+                { brand: 'Google Chrome', version: '131.0.6778.33' },
+                { brand: 'Chromium', version: '131.0.6778.33' },
+                { brand: 'Not_A Brand', version: '24.0.0.0' },
+              ],
+              mobile: false,
+              model: '',
+              platform: 'macOS',
+              platformVersion: '10.15.7',
+              architecture: 'x86',
+              bitness: '64',
+              wow64: false,
+            }),
+            toJSON: () => ({
+              brands: [
+                { brand: 'Google Chrome', version: '131' },
+                { brand: 'Chromium', version: '131' },
+                { brand: 'Not_A Brand', version: '24' },
+              ],
+              mobile: false,
+              platform: 'macOS',
+            }),
+          }),
+        });
+      }
+
+      // Fake plugins array (headless has empty plugins)
+      Object.defineProperty(navigator, 'plugins', {
+        get: () => {
+          const arr = [
+            { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format', length: 1 },
+            { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '', length: 1 },
+            { name: 'Native Client', filename: 'internal-nacl-plugin', description: '', length: 1 },
+          ];
+          arr.length = 3;
+          return arr;
+        },
+      });
+
+      // Override navigator.languages
+      Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+
+      // Add chrome runtime object (missing in headless)
+      if (!window.chrome) window.chrome = {};
+      if (!window.chrome.runtime) window.chrome.runtime = {};
+
+      // Override permissions query
+      const origQuery = navigator.permissions.query.bind(navigator.permissions);
+      navigator.permissions.query = (params) =>
+        params.name === 'notifications'
+          ? Promise.resolve({ state: Notification.permission })
+          : origQuery(params);
+    `);
+    logger.info('[launchBrowser] Anti-detection init scripts injected');
+
     const cookies = [];
     const lax: 'Lax' | 'Strict' | 'None' = 'Lax';
     cookies.push({
@@ -294,6 +397,7 @@ class SunoApi {
       })
     }
     await context.addCookies(cookies);
+    logger.info('[launchBrowser] Cookies injected: ' + cookies.map(c => c.name).join(', '));
     return context;
   }
 
@@ -302,48 +406,174 @@ class SunoApi {
    * @returns {string|null} hCaptcha token. If no verification is required, returns null
    */
   public async getCaptcha(): Promise<string|null> {
-    if (!await this.captchaRequired())
+    logger.info('[getCaptcha] Checking if CAPTCHA is required...');
+    const captchaNeeded = await this.captchaRequired();
+    if (!captchaNeeded) {
+      logger.info('[getCaptcha] No CAPTCHA required, skipping browser flow');
       return null;
+    }
 
-    logger.info('CAPTCHA required. Launching browser...')
+    logger.info('[getCaptcha] CAPTCHA required. Launching browser...');
     const browser = await this.launchBrowser();
     const page = await browser.newPage();
-    await page.goto('https://suno.com/create', { referer: 'https://www.google.com/', waitUntil: 'domcontentloaded', timeout: 0 });
 
-    logger.info('Waiting for Suno interface to load');
-    // await page.locator('.react-aria-GridList').waitFor({ timeout: 60000 });
-    await page.waitForResponse('**/api/project/**\\?**', { timeout: 60000 }); // wait for song list API call
-
-    if (this.ghostCursorEnabled)
-      this.cursor = await createCursor(page);
-    
-    logger.info('Triggering the CAPTCHA');
+    // Override User-Agent Client Hints at network level via CDP to hide HeadlessChrome
     try {
-      await page.getByLabel('Close').click({ timeout: 2000 }); // close all popups
-      // await this.click(page, { x: 318, y: 13 });
-    } catch(e) {}
+      const cdpSession = await browser.newCDPSession(page);
+      await cdpSession.send('Network.setUserAgentOverride', {
+        userAgent: this.userAgent!,
+        userAgentMetadata: {
+          brands: [
+            { brand: 'Google Chrome', version: '131' },
+            { brand: 'Chromium', version: '131' },
+            { brand: 'Not_A Brand', version: '24' },
+          ],
+          fullVersionList: [
+            { brand: 'Google Chrome', version: '131.0.6778.33' },
+            { brand: 'Chromium', version: '131.0.6778.33' },
+            { brand: 'Not_A Brand', version: '24.0.0.0' },
+          ],
+          fullVersion: '131.0.6778.33',
+          platform: 'macOS',
+          platformVersion: '10.15.7',
+          architecture: 'x86',
+          model: '',
+          mobile: false,
+          bitness: '64',
+          wow64: false,
+        },
+      });
+      logger.info('[getCaptcha] CDP: User-Agent Client Hints overridden (HeadlessChrome -> Google Chrome)');
+    } catch (e: any) {
+      logger.warn('[getCaptcha] CDP Client Hints override failed: ' + e.message);
+    }
 
-    const textarea = page.locator('.custom-textarea');
+    // Strip CSP headers from hCaptcha pages to allow service worker + scripts loading
+    await page.route('**/captcha/**', async (route: any) => {
+      try {
+        const response = await route.fetch();
+        const headers = { ...response.headers() };
+        delete headers['content-security-policy'];
+        delete headers['content-security-policy-report-only'];
+        delete headers['cross-origin-embedder-policy'];
+        await route.fulfill({ response, headers });
+      } catch {
+        await route.continue();
+      }
+    });
+    logger.info('[getCaptcha] CSP stripping route registered for hCaptcha pages');
+
+    // Forward browser console messages to server log
+    page.on('console', msg => logger.info('[browser:console] ' + msg.type() + ': ' + msg.text()));
+    page.on('pageerror', err => logger.error('[browser:pageerror] ' + err.message));
+    page.on('requestfailed', req => logger.warn('[browser:requestfailed] ' + req.method() + ' ' + req.url() + ' -> ' + req.failure()?.errorText));
+
+    logger.info('[getCaptcha] Navigating to https://suno.com/create ...');
+    try {
+      await page.goto('https://suno.com/create', { referer: 'https://www.google.com/', waitUntil: 'domcontentloaded', timeout: 0 });
+      logger.info('[getCaptcha] Page loaded (domcontentloaded). Current URL: ' + page.url());
+    } catch (e: any) {
+      logger.error('[getCaptcha] page.goto failed: ' + e.message);
+      throw e;
+    }
+
+    logger.info('[getCaptcha] Waiting for Suno project API response (**/api/project/**) ...');
+    try {
+      await page.waitForResponse('**/api/project/**\\?**', { timeout: 60000 });
+      logger.info('[getCaptcha] Project API response received. Suno interface is ready.');
+    } catch (e: any) {
+      logger.error('[getCaptcha] waitForResponse(**/api/project/**) timed out or failed: ' + e.message);
+      // Take screenshot for diagnosis
+      try {
+        const screenshotPath = path.join(process.cwd(), 'public', 'debug-project-api-timeout.png');
+        await page.screenshot({ path: screenshotPath, fullPage: true });
+        logger.info('[getCaptcha] Debug screenshot saved to: ' + screenshotPath);
+      } catch (ssErr: any) {
+        logger.warn('[getCaptcha] Could not save screenshot: ' + ssErr.message);
+      }
+      throw e;
+    }
+
+    if (this.ghostCursorEnabled) {
+      logger.info('[getCaptcha] Initializing ghost cursor...');
+      this.cursor = await createCursor(page);
+      logger.info('[getCaptcha] Ghost cursor initialized.');
+    }
+
+    logger.info('[getCaptcha] Attempting to close popups (getByLabel Close)...');
+    try {
+      await page.getByLabel('Close').click({ timeout: 2000 });
+      logger.info('[getCaptcha] Popup closed successfully.');
+    } catch(e: any) {
+      logger.info('[getCaptcha] No popup to close (or timed out): ' + e.message);
+    }
+
+    logger.info('[getCaptcha] Locating visible textarea element...');
+    const textarea = page.locator('textarea:visible');
+    try {
+      // Log how many matching elements exist before waiting
+      const count = await textarea.count();
+      logger.info('[getCaptcha] Visible textarea count (before wait): ' + count);
+      logger.info('[getCaptcha] Waiting for visible textarea (timeout=15000ms)...');
+      await textarea.waitFor({ state: 'visible', timeout: 15000 });
+      logger.info('[getCaptcha] Textarea is visible. Clicking...');
+    } catch (e: any) {
+      logger.error('[getCaptcha] Visible textarea not found: ' + e.message);
+      // Dump page HTML for diagnosis
+      try {
+        const html = await page.content();
+        const htmlPath = path.join(process.cwd(), 'public', 'debug-page-content.html');
+        await fs.writeFile(htmlPath, html);
+        logger.info('[getCaptcha] Page HTML dumped to: ' + htmlPath);
+      } catch (htmlErr: any) {
+        logger.warn('[getCaptcha] Could not dump page HTML: ' + htmlErr.message);
+      }
+      try {
+        const screenshotPath = path.join(process.cwd(), 'public', 'debug-textarea-not-found.png');
+        await page.screenshot({ path: screenshotPath, fullPage: true });
+        logger.info('[getCaptcha] Debug screenshot saved to: ' + screenshotPath);
+      } catch (ssErr: any) {
+        logger.warn('[getCaptcha] Could not save screenshot: ' + ssErr.message);
+      }
+      throw e;
+    }
+
     await this.click(textarea);
+    logger.info('[getCaptcha] Clicked textarea. Typing text...');
     await textarea.pressSequentially('Lorem ipsum', { delay: 80 });
+    logger.info('[getCaptcha] Text typed into textarea.');
 
-    const button = page.locator('button[aria-label="Create"]').locator('div.flex');
+    logger.info('[getCaptcha] Locating Create button (button[aria-label*="Create"])...');
+    const button = page.locator('button[aria-label*="Create"]');
+    try {
+      const btnCount = await button.count();
+      logger.info('[getCaptcha] Create button count: ' + btnCount);
+    } catch (e: any) {
+      logger.warn('[getCaptcha] Could not count Create button: ' + e.message);
+    }
+    logger.info('[getCaptcha] Clicking Create button to trigger CAPTCHA...');
     this.click(button);
 
     const controller = new AbortController();
+    logger.info('[getCaptcha] Starting CAPTCHA solver loop...');
     new Promise<void>(async (resolve, reject) => {
       const frame = page.frameLocator('iframe[title*="hCaptcha"]');
       const challenge = frame.locator('.challenge-container');
       try {
         let wait = true;
         while (true) {
-          if (wait)
+          if (wait) {
+            logger.info('[getCaptcha:loop] Waiting for hCaptcha network activity to settle...');
             await waitForRequests(page, controller.signal);
-          const drag = (await challenge.locator('.prompt-text').first().innerText()).toLowerCase().includes('drag');
+            logger.info('[getCaptcha:loop] Network settled. Reading challenge prompt...');
+          }
+          const promptText = (await challenge.locator('.prompt-text').first().innerText()).toLowerCase();
+          logger.info('[getCaptcha:loop] Challenge prompt: "' + promptText + '"');
+          const drag = promptText.includes('drag');
           let captcha: any;
           for (let j = 0; j < 3; j++) { // try several times because sometimes 2Captcha could return an error
             try {
-              logger.info('Sending the CAPTCHA to 2Captcha');
+              logger.info('[getCaptcha:loop] Sending CAPTCHA screenshot to 2Captcha (attempt ' + (j+1) + '/3)...');
               const payload: paramsCoordinates = {
                 body: (await challenge.screenshot({ timeout: 5000 })).toString('base64'),
                 lang: process.env.BROWSER_LOCALE
@@ -354,21 +584,24 @@ class SunoApi {
                 payload.imginstructions = (await fs.readFile(path.join(process.cwd(), 'public', 'drag-instructions.jpg'))).toString('base64');
               }
               captcha = await this.solver.coordinates(payload);
+              logger.info('[getCaptcha:loop] 2Captcha response received. Points: ' + JSON.stringify(captcha?.data));
               break;
             } catch(err: any) {
-              logger.info(err.message);
+              logger.error('[getCaptcha:loop] 2Captcha error (attempt ' + (j+1) + '): ' + err.message);
               if (j != 2)
-                logger.info('Retrying...');
+                logger.info('[getCaptcha:loop] Retrying...');
               else
                 throw err;
             }
           } 
           if (drag) {
+            logger.info('[getCaptcha:loop] Drag challenge detected. Getting bounding box...');
             const challengeBox = await challenge.boundingBox();
             if (challengeBox == null)
               throw new Error('.challenge-container boundingBox is null!');
+            logger.info('[getCaptcha:loop] challengeBox: ' + JSON.stringify(challengeBox));
             if (captcha.data.length % 2) {
-              logger.info('Solution does not have even amount of points required for dragging. Requesting new solution...');
+              logger.info('[getCaptcha:loop] Solution does not have even amount of points required for dragging. Requesting new solution...');
               this.solver.badReport(captcha.id);
               wait = false;
               continue;
@@ -376,7 +609,7 @@ class SunoApi {
             for (let i = 0; i < captcha.data.length; i += 2) {
               const data1 = captcha.data[i];
               const data2 = captcha.data[i+1];
-              logger.info(JSON.stringify(data1) + JSON.stringify(data2));
+              logger.info('[getCaptcha:loop] Drag: ' + JSON.stringify(data1) + ' -> ' + JSON.stringify(data2));
               await page.mouse.move(challengeBox.x + +data1.x, challengeBox.y + +data1.y);
               await page.mouse.down();
               await sleep(1.1); // wait for the piece to be 'unlocked'
@@ -385,40 +618,50 @@ class SunoApi {
             }
             wait = true;
           } else {
+            logger.info('[getCaptcha:loop] Click challenge. Clicking ' + captcha?.data?.length + ' point(s)...');
             for (const data of captcha.data) {
-              logger.info(data);
+              logger.info('[getCaptcha:loop] Clicking point: ' + JSON.stringify(data));
               await this.click(challenge, { x: +data.x, y: +data.y });
             };
           }
+          logger.info('[getCaptcha:loop] Clicking Submit button...');
           this.click(frame.locator('.button-submit')).catch(e => {
-            if (e.message.includes('viewport')) // when hCaptcha window has been closed due to inactivity,
+            if (e.message.includes('viewport')) { // when hCaptcha window has been closed due to inactivity,
+              logger.info('[getCaptcha:loop] Submit button out of viewport, re-clicking Create button...');
               this.click(button); // click the Create button again to trigger the CAPTCHA
-            else
+            } else {
               throw e;
+            }
           });
         }
       } catch(e: any) {
         if (e.message.includes('been closed') // catch error when closing the browser
           || e.message == 'AbortError') // catch error when waitForRequests is aborted
           resolve();
-        else
+        else {
+          logger.error('[getCaptcha:loop] Fatal error in CAPTCHA loop: ' + e.message);
           reject(e);
+        }
       }
     }).catch(e => {
+      logger.error('[getCaptcha] CAPTCHA Promise rejected: ' + e.message);
       browser.browser()?.close();
       throw e;
     });
+
+    logger.info('[getCaptcha] Waiting for /api/generate/v2/ route to capture hCaptcha token...');
     return (new Promise((resolve, reject) => {
       page.route('**/api/generate/v2/**', async (route: any) => {
         try {
-          logger.info('hCaptcha token received. Closing browser');
+          logger.info('[getCaptcha] hCaptcha token received. Closing browser.');
           route.abort();
           browser.browser()?.close();
           controller.abort();
           const request = route.request();
           this.currentToken = request.headers().authorization.split('Bearer ').pop();
           resolve(request.postDataJSON().token);
-        } catch(err) {
+        } catch(err: any) {
+          logger.error('[getCaptcha] Error extracting token from intercepted request: ' + err.message);
           reject(err);
         }
       });
