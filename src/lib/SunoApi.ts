@@ -507,48 +507,91 @@ class SunoApi {
       throw e;
     }
 
+    // FIX: Wait for Clerk handshake navigation to fully settle before touching DOM.
+    // After the project API response, Suno/Clerk may perform an auth redirect
+    // (?__clerk_handshake=...) which destroys the current Playwright execution context.
+    logger.info('[getCaptcha] Waiting for page to settle after auth (Clerk handshake)...');
+    try {
+      await page.waitForLoadState('domcontentloaded', { timeout: 10000 });
+    } catch (e: any) {
+      logger.info('[getCaptcha] domcontentloaded wait timed out, continuing: ' + e.message);
+    }
+    // If we're still in a clerk handshake URL, wait for the final navigation back to /create
+    const currentUrl = page.url();
+    if (currentUrl.includes('__clerk_handshake') || currentUrl.includes('clerk')) {
+      logger.info('[getCaptcha] Clerk redirect URL detected (' + currentUrl.substring(0, 80) + '...), waiting for final navigation...');
+      try {
+        await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 });
+        logger.info('[getCaptcha] Final navigation completed. Current URL: ' + page.url());
+      } catch (e: any) {
+        logger.info('[getCaptcha] waitForNavigation timed out, continuing: ' + e.message);
+      }
+    }
+    // Small buffer for React to hydrate after navigation
+    await sleep(1, 2);
+    logger.info('[getCaptcha] Page settled. Current URL: ' + page.url());
+
     if (this.ghostCursorEnabled) {
       logger.info('[getCaptcha] Initializing ghost cursor...');
       this.cursor = await createCursor(page);
       logger.info('[getCaptcha] Ghost cursor initialized.');
     }
 
+    // FIX: Use .first() to avoid strict mode violation when multiple elements match 'Close'
     logger.info('[getCaptcha] Attempting to close popups (getByLabel Close)...');
     try {
-      await page.getByLabel('Close').click({ timeout: 2000 });
+      await page.getByLabel('Close').first().click({ timeout: 2000 });
       logger.info('[getCaptcha] Popup closed successfully.');
     } catch(e: any) {
       logger.info('[getCaptcha] No popup to close (or timed out): ' + e.message);
     }
 
+    // FIX: Retry textarea finding up to 3 times to handle "Execution context was destroyed"
+    // caused by post-auth navigation events
     logger.info('[getCaptcha] Locating visible textarea element...');
     const textarea = page.locator('textarea:visible');
-    try {
-      // Log how many matching elements exist before waiting
-      const count = await textarea.count();
-      logger.info('[getCaptcha] Visible textarea count (before wait): ' + count);
-      logger.info('[getCaptcha] Waiting for visible textarea (timeout=15000ms)...');
-      await textarea.waitFor({ state: 'visible', timeout: 15000 });
-      logger.info('[getCaptcha] Textarea is visible. Clicking...');
-    } catch (e: any) {
-      logger.error('[getCaptcha] Visible textarea not found: ' + e.message);
-      // Dump page HTML for diagnosis
+    let textareaReady = false;
+    for (let attempt = 1; attempt <= 3; attempt++) {
       try {
-        const html = await page.content();
-        const htmlPath = path.join(process.cwd(), 'public', 'debug-page-content.html');
-        await fs.writeFile(htmlPath, html);
-        logger.info('[getCaptcha] Page HTML dumped to: ' + htmlPath);
-      } catch (htmlErr: any) {
-        logger.warn('[getCaptcha] Could not dump page HTML: ' + htmlErr.message);
+        const count = await textarea.count();
+        logger.info(`[getCaptcha] Visible textarea count (attempt ${attempt}/3): ${count}`);
+        logger.info('[getCaptcha] Waiting for visible textarea (timeout=15000ms)...');
+        await textarea.waitFor({ state: 'visible', timeout: 15000 });
+        logger.info('[getCaptcha] Textarea is visible. Clicking...');
+        textareaReady = true;
+        break;
+      } catch (e: any) {
+        const isNavError = e.message.includes('Execution context was destroyed')
+          || e.message.includes('navigation')
+          || e.message.includes('detached');
+        if (isNavError && attempt < 3) {
+          logger.info(`[getCaptcha] Navigation detected during textarea wait (attempt ${attempt}/3), waiting for page to re-settle...`);
+          try {
+            await page.waitForLoadState('domcontentloaded', { timeout: 15000 });
+          } catch (_) {}
+          await sleep(2, 3);
+          logger.info('[getCaptcha] Retrying textarea search. Current URL: ' + page.url());
+        } else {
+          logger.error('[getCaptcha] Visible textarea not found after ' + attempt + ' attempt(s): ' + e.message);
+          // Dump page HTML for diagnosis
+          try {
+            const html = await page.content();
+            const htmlPath = path.join(process.cwd(), 'public', 'debug-page-content.html');
+            await fs.writeFile(htmlPath, html);
+            logger.info('[getCaptcha] Page HTML dumped to: ' + htmlPath);
+          } catch (htmlErr: any) {
+            logger.warn('[getCaptcha] Could not dump page HTML: ' + htmlErr.message);
+          }
+          try {
+            const screenshotPath = path.join(process.cwd(), 'public', 'debug-textarea-not-found.png');
+            await page.screenshot({ path: screenshotPath, fullPage: true });
+            logger.info('[getCaptcha] Debug screenshot saved to: ' + screenshotPath);
+          } catch (ssErr: any) {
+            logger.warn('[getCaptcha] Could not save screenshot: ' + ssErr.message);
+          }
+          throw e;
+        }
       }
-      try {
-        const screenshotPath = path.join(process.cwd(), 'public', 'debug-textarea-not-found.png');
-        await page.screenshot({ path: screenshotPath, fullPage: true });
-        logger.info('[getCaptcha] Debug screenshot saved to: ' + screenshotPath);
-      } catch (ssErr: any) {
-        logger.warn('[getCaptcha] Could not save screenshot: ' + ssErr.message);
-      }
-      throw e;
     }
 
     await this.click(textarea);
