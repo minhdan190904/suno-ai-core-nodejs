@@ -37,7 +37,7 @@ export const isPage = (target: any): target is Page => {
  */
 export const waitForRequests = (page: Page, signal: AbortSignal): Promise<void> => {
   return new Promise((resolve, reject) => {
-    const urlPattern = /^https:\/\/img[a-zA-Z0-9]*\.hcaptcha\.com\/.*$/;
+    const urlPattern = /^https:\/\/(img[a-zA-Z0-9]*\.hcaptcha\.com|hcaptcha-imgs[a-zA-Z0-9-]*\.suno\.com)\/.*$/;
     let timeoutHandle: NodeJS.Timeout | null = null;
     let activeRequestCount = 0;
     let requestOccurred = false;
@@ -75,17 +75,17 @@ export const waitForRequests = (page: Page, signal: AbortSignal): Promise<void> 
       }
     };
 
-    // Wait for an hCaptcha request for up to 1 minute
+    // Wait for an hCaptcha request for up to 3 minutes
     const initialTimeout = setTimeout(() => {
       if (!requestOccurred) {
         page.off('request', onRequest);
         cleanupListeners();
-        reject(new Error('No hCaptcha request occurred within 1 minute.'));
+        reject(new Error('No hCaptcha image request occurred within 3 minutes.'));
       } else {
         // Start waiting for no hCaptcha requests
         resetTimeout();
       }
-    }, 60000); // 1 minute timeout
+    }, 180000); // 3 minute timeout
 
     page.on('request', onRequest);
     page.on('requestfinished', onRequestFinished);

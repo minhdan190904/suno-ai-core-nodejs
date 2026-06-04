@@ -448,20 +448,33 @@ class SunoApi {
       logger.warn('[getCaptcha] CDP Client Hints override failed: ' + e.message);
     }
 
-    // Strip CSP headers from hCaptcha pages to allow service worker + scripts loading
-    await page.route('**/captcha/**', async (route: any) => {
+    // Strip CSP/COEP headers from Suno and hCaptcha pages to allow hCaptcha SDK + service worker
+    const stripCspHandler = async (route: any) => {
       try {
         const response = await route.fetch();
         const headers = { ...response.headers() };
         delete headers['content-security-policy'];
         delete headers['content-security-policy-report-only'];
         delete headers['cross-origin-embedder-policy'];
-        await route.fulfill({ response, headers });
+        delete headers['cross-origin-opener-policy'];
+
+        // Also strip <meta> CSP tags from HTML responses (hCaptcha embeds CSP in HTML)
+        const contentType = headers['content-type'] || '';
+        if (contentType.includes('text/html')) {
+          let body = await response.text();
+          body = body.replace(/<meta\s+http-equiv=["']Content-Security-Policy["'][^>]*>/gi, '');
+          await route.fulfill({ headers, body, status: response.status() });
+        } else {
+          await route.fulfill({ response, headers });
+        }
       } catch {
         await route.continue();
       }
-    });
-    logger.info('[getCaptcha] CSP stripping route registered for hCaptcha pages');
+    };
+    await page.route('https://suno.com/**', stripCspHandler);
+    await page.route('https://*.suno.com/**', stripCspHandler);
+    await page.route('https://*.hcaptcha.com/**', stripCspHandler);
+    logger.info('[getCaptcha] CSP stripping routes registered for suno.com + subdomains + hcaptcha.com');
 
     // Forward browser console messages to server log
     page.on('console', msg => logger.info('[browser:console] ' + msg.type() + ': ' + msg.text()));
@@ -552,7 +565,23 @@ class SunoApi {
       logger.warn('[getCaptcha] Could not count Create button: ' + e.message);
     }
     logger.info('[getCaptcha] Clicking Create button to trigger CAPTCHA...');
-    this.click(button);
+    await this.click(button);
+
+    // Wait a moment then save debug screenshot to see what the page looks like
+    await sleep(5, 5);
+    try {
+      const debugPath = path.join(process.cwd(), 'public', 'debug-after-create-click.png');
+      await page.screenshot({ path: debugPath, fullPage: true });
+      logger.info('[getCaptcha] Debug screenshot saved: ' + debugPath);
+      // Also check for hCaptcha iframe presence
+      const hcaptchaFrames = page.frames().filter((f: any) => f.url().includes('hcaptcha'));
+      logger.info('[getCaptcha] hCaptcha iframe count: ' + hcaptchaFrames.length);
+      for (const f of hcaptchaFrames) {
+        logger.info('[getCaptcha] hCaptcha frame URL: ' + f.url());
+      }
+    } catch (ssErr: any) {
+      logger.warn('[getCaptcha] Debug screenshot failed: ' + ssErr.message);
+    }
 
     const controller = new AbortController();
     logger.info('[getCaptcha] Starting CAPTCHA solver loop...');
@@ -561,11 +590,24 @@ class SunoApi {
       const challenge = frame.locator('.challenge-container');
       try {
         let wait = true;
+        let firstIteration = true;
         while (true) {
           if (wait) {
-            logger.info('[getCaptcha:loop] Waiting for hCaptcha network activity to settle...');
-            await waitForRequests(page, controller.signal);
-            logger.info('[getCaptcha:loop] Network settled. Reading challenge prompt...');
+            if (firstIteration) {
+              // First iteration: wait for challenge container to become visible
+              // (waitForRequests won't work here because images may load from custom domains)
+              logger.info('[getCaptcha:loop] Waiting for hCaptcha challenge to appear (up to 3 min)...');
+              await challenge.locator('.prompt-text').first().waitFor({ state: 'visible', timeout: 180000 });
+              logger.info('[getCaptcha:loop] Challenge container is now visible! Waiting for images to load...');
+              await sleep(3, 5); // Let challenge images fully load
+              firstIteration = false;
+            } else {
+              // Subsequent iterations: wait for new challenge images after submitting an answer
+              logger.info('[getCaptcha:loop] Waiting for hCaptcha network activity to settle...');
+              await waitForRequests(page, controller.signal);
+              logger.info('[getCaptcha:loop] Network settled.');
+            }
+            logger.info('[getCaptcha:loop] Reading challenge prompt...');
           }
           const promptText = (await challenge.locator('.prompt-text').first().innerText()).toLowerCase();
           logger.info('[getCaptcha:loop] Challenge prompt: "' + promptText + '"');
@@ -645,12 +687,20 @@ class SunoApi {
       }
     }).catch(e => {
       logger.error('[getCaptcha] CAPTCHA Promise rejected: ' + e.message);
+      // Save crash screenshot for debugging
+      try {
+        const crashPath = path.join(process.cwd(), 'public', 'debug-captcha-crash.png');
+        page.screenshot({ path: crashPath, fullPage: true }).catch(() => {});
+      } catch {}
       browser.browser()?.close();
-      throw e;
+      // Graceful degradation: return null instead of crashing
+      logger.warn('[getCaptcha] Captcha failed, will try generate without token (graceful fallback)');
     });
 
     logger.info('[getCaptcha] Waiting for /api/generate/v2/ route to capture hCaptcha token...');
-    return (new Promise((resolve, reject) => {
+
+    // Race between token capture and a 2-minute timeout for graceful fallback
+    const tokenPromise = new Promise<string|null>((resolve, reject) => {
       page.route('**/api/generate/v2/**', async (route: any) => {
         try {
           logger.info('[getCaptcha] hCaptcha token received. Closing browser.');
@@ -665,7 +715,20 @@ class SunoApi {
           reject(err);
         }
       });
-    }));
+    });
+
+    const timeoutPromise = new Promise<string|null>((resolve) => {
+      setTimeout(() => {
+        logger.warn('[getCaptcha] Captcha token capture timed out after 2 minutes. Returning null (graceful fallback).');
+        try {
+          browser.browser()?.close();
+          controller.abort();
+        } catch {}
+        resolve(null);
+      }, 120000); // 2 minutes
+    });
+
+    return Promise.race([tokenPromise, timeoutPromise]);
   }
 
   /**
