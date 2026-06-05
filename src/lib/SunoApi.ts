@@ -406,16 +406,27 @@ class SunoApi {
    * @returns {string|null} hCaptcha token. If no verification is required, returns null
    */
   public async getCaptcha(): Promise<string|null> {
-    logger.info('[getCaptcha] Checking if CAPTCHA is required...');
+    const captchaStartMs = Date.now();
+    logger.info('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    logger.info('[getCaptcha] 🔐 Bắt đầu quy trình xác minh CAPTCHA');
+    logger.info('[getCaptcha] Thời điểm bắt đầu: ' + new Date().toISOString());
+    logger.info('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+
+    logger.info('[getCaptcha] [1/10] Kiểm tra xem có cần CAPTCHA không (/api/c/check)...');
+    const checkStart = Date.now();
     const captchaNeeded = await this.captchaRequired();
+    logger.info(`[getCaptcha] Kết quả kiểm tra: captchaRequired=${captchaNeeded} (${Date.now() - checkStart}ms)`);
     if (!captchaNeeded) {
-      logger.info('[getCaptcha] No CAPTCHA required, skipping browser flow');
+      logger.info('[getCaptcha] ✅ Không cần CAPTCHA, bỏ qua browser flow. Tổng thời gian: ' + (Date.now() - captchaStartMs) + 'ms');
       return null;
     }
+    logger.info('[getCaptcha] ⚠️  CAPTCHA BẮT BUỘC — Sẽ mở browser Playwright để giải...');
 
-    logger.info('[getCaptcha] CAPTCHA required. Launching browser...');
+    logger.info('[getCaptcha] [2/10] Khởi động browser Playwright...');
+    const browserLaunchStart = Date.now();
     const browser = await this.launchBrowser();
     const page = await browser.newPage();
+    logger.info(`[getCaptcha] ✅ Browser đã khởi động (${Date.now() - browserLaunchStart}ms). UserAgent: ${this.userAgent?.substring(0, 60)}...`);
 
     // Override User-Agent Client Hints at network level via CDP to hide HeadlessChrome
     try {
@@ -448,8 +459,31 @@ class SunoApi {
       logger.warn('[getCaptcha] CDP Client Hints override failed: ' + e.message);
     }
 
+    // Callback shared giữa CSP handler và tokenPromise
+    // Khi CSP handler phát hiện URL /api/generate/v2 → gọi callback này thay vì fetch()
+    let onGenerateIntercepted: ((route: any) => void) | null = null;
+
     // Strip CSP/COEP headers from Suno and hCaptcha pages to allow hCaptcha SDK + service worker
     const stripCspHandler = async (route: any) => {
+      const url = route.request().url();
+
+      // *** CRITICAL FIX ***
+      // Nếu URL là /api/generate/v2 → KHÔNG fetch, ABORT ngay!
+      // Đây là request tạo bài hát "Lorem ipsum" mà ta cần chặn.
+      // page.route() luôn ưu tiên hơn context.route() trong Playwright,
+      // nên phải xử lý ngay trong đây.
+      if (url.includes('/api/generate/v2')) {
+        logger.info(`[getCaptcha:CSP] 🎯 CHẶN request generate/v2: ${url.substring(0, 100)}`);
+        if (onGenerateIntercepted) {
+          onGenerateIntercepted(route);
+        } else {
+          // Callback chưa sẵn sàng (race condition rất hiếm) — abort trực tiếp
+          logger.warn('[getCaptcha:CSP] onGenerateIntercepted chưa sẵn sàng, abort trực tiếp.');
+          await route.abort();
+        }
+        return;
+      }
+
       try {
         const response = await route.fetch();
         const headers = { ...response.headers() };
@@ -475,34 +509,62 @@ class SunoApi {
     await page.route('https://*.suno.com/**', stripCspHandler);
     await page.route('https://*.hcaptcha.com/**', stripCspHandler);
     logger.info('[getCaptcha] CSP stripping routes registered for suno.com + subdomains + hcaptcha.com');
+    logger.info('[getCaptcha] ✅ Generate/v2 interception tích hợp trong CSP handler.');
 
-    // Forward browser console messages to server log
-    page.on('console', msg => logger.info('[browser:console] ' + msg.type() + ': ' + msg.text()));
-    page.on('pageerror', err => logger.error('[browser:pageerror] ' + err.message));
-    page.on('requestfailed', req => logger.warn('[browser:requestfailed] ' + req.method() + ' ' + req.url() + ' -> ' + req.failure()?.errorText));
+    // ── Verbose browser event logging ──
+    page.on('console', msg => {
+      const type = msg.type();
+      const text = msg.text();
+      if (type === 'error') logger.error('[browser:console:ERROR] ' + text);
+      else if (type === 'warning' || type === 'warn') logger.warn('[browser:console:WARN] ' + text);
+      else logger.info('[browser:console:' + type.toUpperCase() + '] ' + text);
+    });
+    page.on('pageerror', err => logger.error('[browser:pageerror] ❌ ' + err.message));
+    page.on('requestfailed', req => logger.warn('[browser:requestfailed] ⚠️  ' + req.method() + ' ' + req.url().substring(0, 120) + ' -> ' + req.failure()?.errorText));
+    page.on('framenavigated', frame => {
+      if (frame === page.mainFrame()) {
+        logger.info('[browser:navigation] 🔀 Trang chuyển sang: ' + frame.url().substring(0, 150));
+      }
+    });
+    page.on('response', resp => {
+      const url = resp.url();
+      const status = resp.status();
+      // Chỉ log các API quan trọng
+      if (url.includes('/api/c/check') || url.includes('/api/project') ||
+          url.includes('/api/generate') || url.includes('clerk') ||
+          url.includes('hcaptcha')) {
+        const emoji = status >= 400 ? '❌' : '✅';
+        logger.info(`[browser:response] ${emoji} ${status} ${resp.request().method()} ${url.substring(0, 140)}`);
+      }
+    });
 
-    logger.info('[getCaptcha] Navigating to https://suno.com/create ...');
+    logger.info('[getCaptcha] [3/10] Điều hướng đến https://suno.com/create ...');
+    const gotoStart = Date.now();
     try {
       await page.goto('https://suno.com/create', { referer: 'https://www.google.com/', waitUntil: 'domcontentloaded', timeout: 0 });
-      logger.info('[getCaptcha] Page loaded (domcontentloaded). Current URL: ' + page.url());
+      logger.info(`[getCaptcha] ✅ Trang đã tải (domcontentloaded) sau ${Date.now() - gotoStart}ms`);
+      logger.info('[getCaptcha] URL hiện tại: ' + page.url());
+      logger.info('[getCaptcha] Tiêu đề trang: ' + await page.title().catch(() => '(không lấy được)'));
     } catch (e: any) {
-      logger.error('[getCaptcha] page.goto failed: ' + e.message);
+      logger.error('[getCaptcha] ❌ page.goto thất bại sau ' + (Date.now() - gotoStart) + 'ms: ' + e.message);
       throw e;
     }
 
-    logger.info('[getCaptcha] Waiting for Suno project API response (**/api/project/**) ...');
+    logger.info('[getCaptcha] [4/10] Chờ Suno project API response (**/api/project/**) — tối đa 60s...');
+    const projectApiStart = Date.now();
     try {
-      await page.waitForResponse('**/api/project/**\\?**', { timeout: 60000 });
-      logger.info('[getCaptcha] Project API response received. Suno interface is ready.');
+      const projectResp = await page.waitForResponse('**/api/project/**\\?**', { timeout: 60000 });
+      logger.info(`[getCaptcha] ✅ Project API response nhận được sau ${Date.now() - projectApiStart}ms`);
+      logger.info('[getCaptcha] Project API status: ' + projectResp.status() + ' | URL: ' + projectResp.url().substring(0, 120));
+      logger.info('[getCaptcha] Giao diện Suno đã sẵn sàng.');
     } catch (e: any) {
-      logger.error('[getCaptcha] waitForResponse(**/api/project/**) timed out or failed: ' + e.message);
-      // Take screenshot for diagnosis
+      logger.error(`[getCaptcha] ❌ waitForResponse(**/api/project/**) timeout sau ${Date.now() - projectApiStart}ms: ` + e.message);
       try {
         const screenshotPath = path.join(process.cwd(), 'public', 'debug-project-api-timeout.png');
         await page.screenshot({ path: screenshotPath, fullPage: true });
-        logger.info('[getCaptcha] Debug screenshot saved to: ' + screenshotPath);
+        logger.info('[getCaptcha] Screenshot đã lưu: ' + screenshotPath);
       } catch (ssErr: any) {
-        logger.warn('[getCaptcha] Could not save screenshot: ' + ssErr.message);
+        logger.warn('[getCaptcha] Không thể lưu screenshot: ' + ssErr.message);
       }
       throw e;
     }
@@ -510,26 +572,35 @@ class SunoApi {
     // FIX: Wait for Clerk handshake navigation to fully settle before touching DOM.
     // After the project API response, Suno/Clerk may perform an auth redirect
     // (?__clerk_handshake=...) which destroys the current Playwright execution context.
-    logger.info('[getCaptcha] Waiting for page to settle after auth (Clerk handshake)...');
+    logger.info('[getCaptcha] [5/10] Chờ trang ổn định sau Clerk handshake auth...');
+    const settleStart = Date.now();
     try {
       await page.waitForLoadState('domcontentloaded', { timeout: 10000 });
+      logger.info(`[getCaptcha] domcontentloaded OK sau ${Date.now() - settleStart}ms`);
     } catch (e: any) {
-      logger.info('[getCaptcha] domcontentloaded wait timed out, continuing: ' + e.message);
+      logger.warn('[getCaptcha] domcontentloaded timeout, tiếp tục: ' + e.message);
     }
-    // If we're still in a clerk handshake URL, wait for the final navigation back to /create
     const currentUrl = page.url();
-    if (currentUrl.includes('__clerk_handshake') || currentUrl.includes('clerk')) {
-      logger.info('[getCaptcha] Clerk redirect URL detected (' + currentUrl.substring(0, 80) + '...), waiting for final navigation...');
+    logger.info('[getCaptcha] URL sau project API: ' + currentUrl);
+    const hasClerkHandshake = currentUrl.includes('__clerk_handshake');
+    const hasClerkInUrl = currentUrl.includes('clerk');
+    logger.info(`[getCaptcha] Clerk handshake trong URL: ${hasClerkHandshake} | Clerk URL: ${hasClerkInUrl}`);
+    if (hasClerkHandshake || hasClerkInUrl) {
+      logger.info('[getCaptcha] 🔄 Phát hiện Clerk redirect, đang chờ navigation cuối cùng...');
+      logger.info('[getCaptcha] URL đầy đủ: ' + currentUrl.substring(0, 200));
       try {
+        const navStart = Date.now();
         await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 });
-        logger.info('[getCaptcha] Final navigation completed. Current URL: ' + page.url());
+        logger.info(`[getCaptcha] ✅ Navigation hoàn thành sau ${Date.now() - navStart}ms`);
+        logger.info('[getCaptcha] URL sau clerk redirect: ' + page.url());
       } catch (e: any) {
-        logger.info('[getCaptcha] waitForNavigation timed out, continuing: ' + e.message);
+        logger.warn('[getCaptcha] waitForNavigation timeout, tiếp tục: ' + e.message);
       }
     }
-    // Small buffer for React to hydrate after navigation
-    await sleep(1, 2);
-    logger.info('[getCaptcha] Page settled. Current URL: ' + page.url());
+    await sleep(0.2, 0.3);
+    logger.info('[getCaptcha] ✅ Trang đã ổn định. URL cuối: ' + page.url());
+    logger.info(`[getCaptcha] Tiêu đề trang: ${await page.title().catch(() => '(lỗi)')}`);
+    logger.info(`[getCaptcha] Tổng thời gian settle: ${Date.now() - settleStart}ms`);
 
     if (this.ghostCursorEnabled) {
       logger.info('[getCaptcha] Initializing ghost cursor...');
@@ -537,13 +608,24 @@ class SunoApi {
       logger.info('[getCaptcha] Ghost cursor initialized.');
     }
 
-    // FIX: Use .first() to avoid strict mode violation when multiple elements match 'Close'
-    logger.info('[getCaptcha] Attempting to close popups (getByLabel Close)...');
+    logger.info('[getCaptcha] [6/10] Kiểm tra và đóng popup...');
     try {
-      await page.getByLabel('Close').first().click({ timeout: 2000 });
-      logger.info('[getCaptcha] Popup closed successfully.');
+      const closeButtons = page.getByLabel('Close');
+      const closeCount = await closeButtons.count().catch(() => 0);
+      logger.info(`[getCaptcha] Số nút Close tìm thấy: ${closeCount}`);
+      if (closeCount > 0) {
+        for (let i = 0; i < closeCount; i++) {
+          const btn = closeButtons.nth(i);
+          const ariaLabel = await btn.getAttribute('aria-label').catch(() => '?');
+          logger.info(`[getCaptcha] Nút Close #${i+1}: aria-label="${ariaLabel}"`);
+        }
+        await closeButtons.first().click({ timeout: 2000 });
+        logger.info('[getCaptcha] ✅ Đã đóng popup.');
+      } else {
+        logger.info('[getCaptcha] Không có popup nào cần đóng.');
+      }
     } catch(e: any) {
-      logger.info('[getCaptcha] No popup to close (or timed out): ' + e.message);
+      logger.info('[getCaptcha] Không đóng được popup (hoặc timeout): ' + e.message);
     }
 
     // FIX: Retry textarea finding up to 3 times to handle "Execution context was destroyed"
@@ -569,7 +651,7 @@ class SunoApi {
           try {
             await page.waitForLoadState('domcontentloaded', { timeout: 15000 });
           } catch (_) {}
-          await sleep(2, 3);
+          await sleep(0.5, 1);
           logger.info('[getCaptcha] Retrying textarea search. Current URL: ' + page.url());
         } else {
           logger.error('[getCaptcha] Visible textarea not found after ' + attempt + ' attempt(s): ' + e.message);
@@ -594,40 +676,67 @@ class SunoApi {
       }
     }
 
+    logger.info('[getCaptcha] [8/10] Click textarea và nhập text mồi ("Lorem ipsum")...');
+    const textareaBox = await textarea.boundingBox().catch(() => null);
+    logger.info('[getCaptcha] Textarea bounding box: ' + JSON.stringify(textareaBox));
     await this.click(textarea);
-    logger.info('[getCaptcha] Clicked textarea. Typing text...');
-    await textarea.pressSequentially('Lorem ipsum', { delay: 80 });
-    logger.info('[getCaptcha] Text typed into textarea.');
+    logger.info('[getCaptcha] ✅ Đã click textarea.');
+    await textarea.pressSequentially('Lorem ipsum', { delay: 20 });
+    logger.info('[getCaptcha] ✅ Đã nhập "Lorem ipsum" vào textarea. (Đây là text MỒI để trigger hCaptcha, không phải prompt thật)');
 
-    logger.info('[getCaptcha] Locating Create button (button[aria-label*="Create"])...');
+    logger.info('[getCaptcha] [9/10] Tìm nút Create để trigger hCaptcha...');
     const button = page.locator('button[aria-label*="Create"]');
     try {
       const btnCount = await button.count();
-      logger.info('[getCaptcha] Create button count: ' + btnCount);
+      logger.info('[getCaptcha] Số nút Create tìm thấy: ' + btnCount);
+      for (let i = 0; i < Math.min(btnCount, 3); i++) {
+        const ariaLabel = await button.nth(i).getAttribute('aria-label').catch(() => '?');
+        const isDisabled = await button.nth(i).isDisabled().catch(() => false);
+        logger.info(`[getCaptcha] Nút Create #${i+1}: aria-label="${ariaLabel}" | disabled=${isDisabled}`);
+      }
     } catch (e: any) {
-      logger.warn('[getCaptcha] Could not count Create button: ' + e.message);
+      logger.warn('[getCaptcha] Không đếm được nút Create: ' + e.message);
     }
-    logger.info('[getCaptcha] Clicking Create button to trigger CAPTCHA...');
+    logger.info('[getCaptcha] 🖱️  Đang click nút Create để trigger hCaptcha...');
     await this.click(button);
+    logger.info('[getCaptcha] ✅ Đã click nút Create. hCaptcha sẽ xuất hiện...');
 
-    // Wait a moment then save debug screenshot to see what the page looks like
-    await sleep(5, 5);
+    // OPT: Chờ hCaptcha iframe xuất hiện bằng src URL (title không chứa "hCaptcha")
+    logger.info('[getCaptcha] Chờ hCaptcha iframe xuất hiện (tối đa 5s)...');
+    const iframeStart = Date.now();
+    try {
+      await page.waitForSelector('iframe[src*="hcaptcha"]', { timeout: 5000 });
+      logger.info(`[getCaptcha] ✅ hCaptcha iframe xuất hiện sau ${Date.now() - iframeStart}ms`);
+    } catch (e: any) {
+      logger.warn(`[getCaptcha] hCaptcha iframe chưa xuất hiện sau 5s, tiếp tục... (${e.message.substring(0, 60)})`);
+    }
     try {
       const debugPath = path.join(process.cwd(), 'public', 'debug-after-create-click.png');
       await page.screenshot({ path: debugPath, fullPage: true });
-      logger.info('[getCaptcha] Debug screenshot saved: ' + debugPath);
-      // Also check for hCaptcha iframe presence
-      const hcaptchaFrames = page.frames().filter((f: any) => f.url().includes('hcaptcha'));
-      logger.info('[getCaptcha] hCaptcha iframe count: ' + hcaptchaFrames.length);
-      for (const f of hcaptchaFrames) {
-        logger.info('[getCaptcha] hCaptcha frame URL: ' + f.url());
+      logger.info('[getCaptcha] 📸 Screenshot sau click Create: ' + debugPath);
+      const allFrames = page.frames();
+      logger.info(`[getCaptcha] Tổng số frames trên trang: ${allFrames.length}`);
+      const hcaptchaFrames = allFrames.filter((f: any) => f.url().includes('hcaptcha'));
+      logger.info(`[getCaptcha] Số hCaptcha iframe: ${hcaptchaFrames.length}`);
+      if (hcaptchaFrames.length === 0) {
+        logger.warn('[getCaptcha] ⚠️  KHÔNG tìm thấy hCaptcha iframe! Có thể Suno không yêu cầu captcha lần này.');
+        logger.info('[getCaptcha] Danh sách tất cả frames:');
+        allFrames.forEach((f: any, i: number) => logger.info(`  Frame #${i}: ${f.url().substring(0, 120)}`));
+      } else {
+        hcaptchaFrames.forEach((f: any, i: number) => {
+          logger.info(`[getCaptcha] hCaptcha frame #${i+1}: ${f.url().substring(0, 200)}`);
+        });
       }
     } catch (ssErr: any) {
-      logger.warn('[getCaptcha] Debug screenshot failed: ' + ssErr.message);
+      logger.warn('[getCaptcha] Debug screenshot thất bại: ' + ssErr.message);
     }
 
     const controller = new AbortController();
-    logger.info('[getCaptcha] Starting CAPTCHA solver loop...');
+    const challengeStartMs = Date.now();
+    logger.info('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    logger.info('[getCaptcha] [10/10] 🤖 Bắt đầu vòng lặp giải CAPTCHA (2Captcha)...');
+    logger.info('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    let challengeRound = 0;
     new Promise<void>(async (resolve, reject) => {
       const frame = page.frameLocator('iframe[title*="hCaptcha"]');
       const challenge = frame.locator('.challenge-container');
@@ -637,30 +746,41 @@ class SunoApi {
         while (true) {
           if (wait) {
             if (firstIteration) {
-              // First iteration: wait for challenge container to become visible
-              // (waitForRequests won't work here because images may load from custom domains)
-              logger.info('[getCaptcha:loop] Waiting for hCaptcha challenge to appear (up to 3 min)...');
+              logger.info('[getCaptcha:loop] ⏳ Chờ hCaptcha challenge xuất hiện (tối đa 3 phút)...');
+              const waitChallengeStart = Date.now();
               await challenge.locator('.prompt-text').first().waitFor({ state: 'visible', timeout: 180000 });
-              logger.info('[getCaptcha:loop] Challenge container is now visible! Waiting for images to load...');
-              await sleep(3, 5); // Let challenge images fully load
+              logger.info(`[getCaptcha:loop] ✅ Challenge đã xuất hiện sau ${Date.now() - waitChallengeStart}ms. Chờ ảnh load...`);
+              await sleep(0.3, 0.5); // OPT: giảm từ sleep(3,5) xuống 0.3-0.5s, ảnh vẫn đang load kỉ khi 2Captcha chụp screenshot
               firstIteration = false;
             } else {
-              // Subsequent iterations: wait for new challenge images after submitting an answer
-              logger.info('[getCaptcha:loop] Waiting for hCaptcha network activity to settle...');
-              await waitForRequests(page, controller.signal);
-              logger.info('[getCaptcha:loop] Network settled.');
+              // OPT: Thêm max timeout 12s — tránh treo vô tận khi captcha đã pass
+              // (khi captcha pass, generate request đã bị abort, không có hình mới nào load)
+              logger.info('[getCaptcha:loop] Chờ hCaptcha network settle (tối đa 12s)...');
+              const settleResult = await Promise.race([
+                waitForRequests(page, controller.signal),
+                new Promise<void>(r => setTimeout(r, 12000))
+              ]);
+              logger.info('[getCaptcha:loop] Network settled (hoặc timeout 12s).');
             }
             logger.info('[getCaptcha:loop] Reading challenge prompt...');
           }
+          challengeRound++;
+          const roundStart = Date.now();
           const promptText = (await challenge.locator('.prompt-text').first().innerText()).toLowerCase();
-          logger.info('[getCaptcha:loop] Challenge prompt: "' + promptText + '"');
+          const challengeType = promptText.includes('drag') ? 'DRAG' : 'CLICK';
+          logger.info(`[getCaptcha:loop] ── Round ${challengeRound} ─────────────────────────`);
+          logger.info(`[getCaptcha:loop] Loại challenge: ${challengeType}`);
+          logger.info(`[getCaptcha:loop] Nội dung prompt: "${promptText}"`);
+          logger.info(`[getCaptcha:loop] Thời gian kể từ lần click Create: ${Date.now() - challengeStartMs}ms`);
           const drag = promptText.includes('drag');
           let captcha: any;
           for (let j = 0; j < 3; j++) { // try several times because sometimes 2Captcha could return an error
             try {
-              logger.info('[getCaptcha:loop] Sending CAPTCHA screenshot to 2Captcha (attempt ' + (j+1) + '/3)...');
+              logger.info(`[getCaptcha:loop] 📤 Gửi screenshot lên 2Captcha (lần ${j+1}/3)...`);
+              const screenshotBuf = await challenge.screenshot({ timeout: 5000 });
+              logger.info(`[getCaptcha:loop] Screenshot kích thước: ${screenshotBuf.length} bytes (${Math.round(screenshotBuf.length/1024)}KB)`);
               const payload: paramsCoordinates = {
-                body: (await challenge.screenshot({ timeout: 5000 })).toString('base64'),
+                body: screenshotBuf.toString('base64'),
                 lang: process.env.BROWSER_LOCALE
               };
               if (drag) {
@@ -668,8 +788,12 @@ class SunoApi {
                 payload.textinstructions = 'CLICK on the shapes at their edge or center as shown above—please be precise!';
                 payload.imginstructions = (await fs.readFile(path.join(process.cwd(), 'public', 'drag-instructions.jpg'))).toString('base64');
               }
+              const solveStart = Date.now();
               captcha = await this.solver.coordinates(payload);
-              logger.info('[getCaptcha:loop] 2Captcha response received. Points: ' + JSON.stringify(captcha?.data));
+              logger.info(`[getCaptcha:loop] ✅ 2Captcha trả lời sau ${Date.now() - solveStart}ms`);
+              logger.info(`[getCaptcha:loop] Captcha ID: ${captcha?.id}`);
+              logger.info(`[getCaptcha:loop] Số điểm cần click: ${captcha?.data?.length}`);
+              logger.info(`[getCaptcha:loop] Tọa độ: ${JSON.stringify(captcha?.data)}`);
               break;
             } catch(err: any) {
               logger.error('[getCaptcha:loop] 2Captcha error (attempt ' + (j+1) + '): ' + err.message);
@@ -703,12 +827,15 @@ class SunoApi {
             }
             wait = true;
           } else {
-            logger.info('[getCaptcha:loop] Click challenge. Clicking ' + captcha?.data?.length + ' point(s)...');
-            for (const data of captcha.data) {
-              logger.info('[getCaptcha:loop] Clicking point: ' + JSON.stringify(data));
+            logger.info(`[getCaptcha:loop] 🖱️  Click challenge: ${captcha?.data?.length} điểm cần click`);
+            for (let ci = 0; ci < captcha.data.length; ci++) {
+              const data = captcha.data[ci];
+              logger.info(`[getCaptcha:loop] Click điểm ${ci+1}/${captcha.data.length}: x=${data.x}, y=${data.y}`);
               await this.click(challenge, { x: +data.x, y: +data.y });
-            };
+              logger.info(`[getCaptcha:loop] ✅ Đã click điểm ${ci+1}`);
+            }
           }
+          logger.info(`[getCaptcha:loop] Round ${challengeRound} hoàn thành sau ${Date.now() - roundStart}ms. Đang Submit...`);
           logger.info('[getCaptcha:loop] Clicking Submit button...');
           this.click(frame.locator('.button-submit')).catch(e => {
             if (e.message.includes('viewport')) { // when hCaptcha window has been closed due to inactivity,
@@ -720,11 +847,11 @@ class SunoApi {
           });
         }
       } catch(e: any) {
-        if (e.message.includes('been closed') // catch error when closing the browser
-          || e.message == 'AbortError') // catch error when waitForRequests is aborted
+        if (e.message.includes('been closed') || e.message == 'AbortError') {
+          logger.info(`[getCaptcha:loop] Vòng lặp CAPTCHA kết thúc bình thường sau ${challengeRound} round(s). Lý do: ${e.message.substring(0, 60)}`);
           resolve();
-        else {
-          logger.error('[getCaptcha:loop] Fatal error in CAPTCHA loop: ' + e.message);
+        } else {
+          logger.error('[getCaptcha:loop] ❌ Lỗi nghiêm trọng trong vòng lặp CAPTCHA: ' + e.message);
           reject(e);
         }
       }
@@ -740,35 +867,59 @@ class SunoApi {
       logger.warn('[getCaptcha] Captcha failed, will try generate without token (graceful fallback)');
     });
 
-    logger.info('[getCaptcha] Waiting for /api/generate/v2/ route to capture hCaptcha token...');
+    // FIX: Dùng callback thay vì context.route() vì page.route() CSP handler 
+    // luôn ưu tiên hơn context.route() trong Playwright.
+    // Callback được gọi từ bên trong stripCspHandler khi phát hiện /api/generate/v2
+    logger.info('[getCaptcha] ⏳ Đăng ký generate intercept callback...');
+    const tokenWaitStart = Date.now();
 
-    // Race between token capture and a 2-minute timeout for graceful fallback
     const tokenPromise = new Promise<string|null>((resolve, reject) => {
-      page.route('**/api/generate/v2/**', async (route: any) => {
+      // Gán callback — sẽ được gọi bởi CSP handler khi URL chứa /api/generate/v2
+      onGenerateIntercepted = async (route: any) => {
         try {
-          logger.info('[getCaptcha] hCaptcha token received. Closing browser.');
-          route.abort();
+          const elapsed = Date.now() - tokenWaitStart;
+          const url = route.request().url();
+          logger.info(`[getCaptcha] 🎯 Đã intercept ${url} sau ${elapsed}ms!`);
+          const request = route.request();
+          const postData = request.postDataJSON();
+          const token = postData?.token;
+          const authHeader = request.headers().authorization || '';
+          // ABORT FIRST — trước mọi thứ để ngăn Suno tạo bài hát Lorem ipsum
+          await route.abort();
+          logger.info(`[getCaptcha] ✅ ROUTE ABORTED — request KHÔNG đến Suno server!`);
+          logger.info(`[getCaptcha] Token hCaptcha: ${token ? token.substring(0, 30) + '...' : 'KHÔNG CÓ'}`);
+          logger.info(`[getCaptcha] Token length: ${token?.length ?? 0} ký tự`);
+          logger.info(`[getCaptcha] Authorization header: ${authHeader.substring(0, 50)}...`);
+          logger.info(`[getCaptcha] Payload keys: ${Object.keys(postData || {}).join(', ')}`);
+          logger.info('[getCaptcha] Route đã abort — bài hát Lorem ipsum sẽ KHÔNG được tạo.');
+          this.currentToken = authHeader.split('Bearer ').pop();
           browser.browser()?.close();
           controller.abort();
-          const request = route.request();
-          this.currentToken = request.headers().authorization.split('Bearer ').pop();
-          resolve(request.postDataJSON().token);
+          const totalElapsed = Date.now() - captchaStartMs;
+          logger.info('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+          logger.info(`[getCaptcha] ✅ CAPTCHA HOÀN THÀNH! Bài Lorem ipsum KHÔNG bị tạo.`);
+          logger.info(`[getCaptcha] Tổng thời gian: ${totalElapsed}ms (${Math.round(totalElapsed/1000)}s)`);
+          logger.info(`[getCaptcha] Số round đã giải: ${challengeRound}`);
+          logger.info('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+          resolve(token);
         } catch(err: any) {
-          logger.error('[getCaptcha] Error extracting token from intercepted request: ' + err.message);
+          logger.error('[getCaptcha] ❌ Lỗi khi extract token từ intercepted request: ' + err.message);
           reject(err);
         }
-      });
+      };
+      logger.info('[getCaptcha] ✅ Generate intercept callback đã sẵn sàng.');
     });
 
     const timeoutPromise = new Promise<string|null>((resolve) => {
       setTimeout(() => {
-        logger.warn('[getCaptcha] Captcha token capture timed out after 2 minutes. Returning null (graceful fallback).');
+        const elapsed = Date.now() - captchaStartMs;
+        logger.warn(`[getCaptcha] ⏰ Timeout sau 2 phút (${elapsed}ms). Trả về null (graceful fallback).`);
         try {
           browser.browser()?.close();
           controller.abort();
         } catch {}
         resolve(null);
-      }, 120000); // 2 minutes
+      }, 120000);
     });
 
     return Promise.race([tokenPromise, timeoutPromise]);
