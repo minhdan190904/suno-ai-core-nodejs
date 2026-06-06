@@ -194,8 +194,7 @@ export default function StudioPage() {
                   onChange={e => setPrompt(e.target.value)}
                   placeholder="Ví dụ: Một bài ballad nhẹ nhàng về mùa thu Hà Nội, giọng nữ ngọt ngào, tiếng Việt..."
                   rows={4}
-                  className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-white placeholder-white/25
-                    focus:outline-none focus:border-indigo-500/50 focus:bg-white/[0.07] resize-none transition-all duration-200 text-sm"
+                  className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-white placeholder-white/25 focus:outline-none focus:border-indigo-500/50 focus:bg-white/[0.07] resize-none transition-all duration-200 text-sm"
                 />
                 <p className="text-xs text-white/30 mt-1.5">💡 Mô tả càng chi tiết (thể loại, cảm xúc, nhịp độ) thì kết quả càng tốt</p>
               </div>
@@ -213,8 +212,7 @@ export default function StudioPage() {
                     value={title}
                     onChange={e => setTitle(e.target.value)}
                     placeholder="Tên bài hát..."
-                    className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-white placeholder-white/25
-                      focus:outline-none focus:border-indigo-500/50 focus:bg-white/[0.07] transition-all duration-200 text-sm"
+                    className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-white placeholder-white/25 focus:outline-none focus:border-indigo-500/50 focus:bg-white/[0.07] transition-all duration-200 text-sm"
                   />
                 </div>
                 <div>
@@ -224,8 +222,7 @@ export default function StudioPage() {
                     value={tags}
                     onChange={e => setTags(e.target.value)}
                     placeholder="pop, acoustic, sad..."
-                    className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-white placeholder-white/25
-                      focus:outline-none focus:border-indigo-500/50 focus:bg-white/[0.07] transition-all duration-200 text-sm"
+                    className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-white placeholder-white/25 focus:outline-none focus:border-indigo-500/50 focus:bg-white/[0.07] transition-all duration-200 text-sm"
                   />
                 </div>
               </div>
@@ -262,8 +259,7 @@ export default function StudioPage() {
                   onChange={e => setLyrics(e.target.value)}
                   placeholder={`[Verse 1]\nViết lời verse đầu tiên của bạn ở đây...\n\n[Chorus]\nĐiệp khúc của bài hát...\n\n[Verse 2]\n...`}
                   rows={8}
-                  className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-white placeholder-white/25
-                    focus:outline-none focus:border-indigo-500/50 focus:bg-white/[0.07] resize-none transition-all duration-200 text-sm font-mono"
+                  className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-white placeholder-white/25 focus:outline-none focus:border-indigo-500/50 focus:bg-white/[0.07] resize-none transition-all duration-200 text-sm font-mono"
                 />
               </div>
             </div>
