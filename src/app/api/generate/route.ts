@@ -9,7 +9,7 @@ export async function POST(req: NextRequest) {
   if (req.method === 'POST') {
     try {
       const body = await req.json();
-      const { prompt, make_instrumental, model, wait_audio } = body;
+      const { prompt, make_instrumental, model, wait_audio, vocal_gender } = body;
 
       const customCookie = req.headers.get('x-suno-cookie');
       const cookieStr = customCookie || (await cookies()).toString();
@@ -17,7 +17,8 @@ export async function POST(req: NextRequest) {
         prompt,
         Boolean(make_instrumental),
         model || DEFAULT_MODEL,
-        Boolean(wait_audio)
+        Boolean(wait_audio),
+        vocal_gender || undefined
       );
 
       return new NextResponse(JSON.stringify(audioInfo), {

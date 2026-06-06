@@ -950,7 +950,8 @@ class SunoApi {
     prompt: string,
     make_instrumental: boolean = false,
     model?: string,
-    wait_audio: boolean = false
+    wait_audio: boolean = false,
+    vocal_gender?: string
   ): Promise<AudioInfo[]> {
     await this.keepAlive(false);
     const startTime = Date.now();
@@ -961,7 +962,12 @@ class SunoApi {
       undefined,
       make_instrumental,
       model,
-      wait_audio
+      wait_audio,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      vocal_gender
     );
     const costTime = Date.now() - startTime;
     logger.info('Generate Response:\n' + JSON.stringify(audios, null, 2));
@@ -1010,7 +1016,8 @@ class SunoApi {
     make_instrumental: boolean = false,
     model?: string,
     wait_audio: boolean = false,
-    negative_tags?: string
+    negative_tags?: string,
+    vocal_gender?: string
   ): Promise<AudioInfo[]> {
     const startTime = Date.now();
     const audios = await this.generateSongs(
@@ -1021,7 +1028,11 @@ class SunoApi {
       make_instrumental,
       model,
       wait_audio,
-      negative_tags
+      negative_tags,
+      undefined,
+      undefined,
+      undefined,
+      vocal_gender
     );
     const costTime = Date.now() - startTime;
     logger.info(
@@ -1056,7 +1067,8 @@ class SunoApi {
     negative_tags?: string,
     task?: string,
     continue_clip_id?: string,
-    continue_at?: number
+    continue_at?: number,
+    vocal_gender?: string
   ): Promise<AudioInfo[]> {
     await this.keepAlive();
     // Generate browser-token (mimics Suno web client)
@@ -1076,7 +1088,8 @@ class SunoApi {
       metadata: {
         web_client_pathname: '/create',
         is_max_mode: false,
-        create_mode: isCustom ? 'custom' : 'simple'
+        create_mode: isCustom ? 'custom' : 'simple',
+        ...(vocal_gender ? { vocal_gender } : {})
       },
       artist_clip_id: null,
       artist_start_s: null,
@@ -1148,7 +1161,32 @@ class SunoApi {
       }
       return lastResponse;
     } else {
-      return response.data.clips.map((audio: any) => ({
+      const allClips = response.data.clips;
+      // Log ALL clips for debugging
+      logger.info(`[generateSongs] Suno returned ${allClips.length} clips total:`);
+      allClips.forEach((audio: any, i: number) => {
+        logger.info(`  Clip[${i}]: id=${audio.id}, model_name=${audio.model_name}, title=${audio.title}, major_model_version=${audio.major_model_version}`);
+      });
+
+      // Filter: chỉ giữ clips có model_name = chirp-auk (standard)
+      // Bỏ tất cả model khác (pro/preview/5.5 — chỉ 1 phút, không phải bài full)
+      const standardModel = 'chirp-auk';
+      const standardClips = allClips.filter((audio: any) => {
+        const modelName = (audio.model_name || '');
+        const isStandard = modelName === standardModel;
+        if (isStandard) {
+          logger.info(`  ✅ Keeping standard clip: id=${audio.id}, model_name=${modelName}`);
+        } else {
+          logger.info(`  ❌ Skipping non-standard clip: id=${audio.id}, model_name=${modelName}`);
+        }
+        return isStandard;
+      });
+      
+      // Fallback: nếu không tìm thấy chirp-auk, lấy 2 clip đầu tiên
+      const clipsToReturn = (standardClips.length > 0 ? standardClips : allClips).slice(0, 2);
+      logger.info(`[generateSongs] ➡️  Returning ${clipsToReturn.length} clips (filtered from ${allClips.length}, standard model: ${standardModel})`);
+
+      return clipsToReturn.map((audio: any) => ({
         id: audio.id,
         title: audio.title,
         image_url: audio.image_url,
