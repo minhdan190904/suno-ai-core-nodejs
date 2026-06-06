@@ -847,8 +847,8 @@ class SunoApi {
           });
         }
       } catch(e: any) {
-        if (e.message.includes('been closed') || e.message == 'AbortError') {
-          logger.info(`[getCaptcha:loop] Vòng lặp CAPTCHA kết thúc bình thường sau ${challengeRound} round(s). Lý do: ${e.message.substring(0, 60)}`);
+        if (e.message.includes('been closed') || e.message === 'AbortError' || e.message.includes('Timeout') || e.message.includes('Target page, context or browser has been closed')) {
+          logger.info(`[getCaptcha:loop] Vòng lặp CAPTCHA kết thúc bình thường sau ${challengeRound} round(s). Lý do: ${e.message.substring(0, 80)}`);
           resolve();
         } else {
           logger.error('[getCaptcha:loop] ❌ Lỗi nghiêm trọng trong vòng lặp CAPTCHA: ' + e.message);
@@ -873,6 +873,8 @@ class SunoApi {
     logger.info('[getCaptcha] ⏳ Đăng ký generate intercept callback...');
     const tokenWaitStart = Date.now();
 
+    let timeoutId: ReturnType<typeof setTimeout> | null = null;
+
     const tokenPromise = new Promise<string|null>((resolve, reject) => {
       // Gán callback — sẽ được gọi bởi CSP handler khi URL chứa /api/generate/v2
       onGenerateIntercepted = async (route: any) => {
@@ -895,6 +897,8 @@ class SunoApi {
           this.currentToken = authHeader.split('Bearer ').pop();
           browser.browser()?.close();
           controller.abort();
+          // Clear timeout to prevent misleading 'Timeout' log
+          if (timeoutId) clearTimeout(timeoutId);
           const totalElapsed = Date.now() - captchaStartMs;
           logger.info('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
           logger.info(`[getCaptcha] ✅ CAPTCHA HOÀN THÀNH! Bài Lorem ipsum KHÔNG bị tạo.`);
@@ -911,7 +915,7 @@ class SunoApi {
     });
 
     const timeoutPromise = new Promise<string|null>((resolve) => {
-      setTimeout(() => {
+      timeoutId = setTimeout(() => {
         const elapsed = Date.now() - captchaStartMs;
         logger.warn(`[getCaptcha] ⏰ Timeout sau 2 phút (${elapsed}ms). Trả về null (graceful fallback).`);
         try {
