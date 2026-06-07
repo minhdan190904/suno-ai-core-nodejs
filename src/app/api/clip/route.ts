@@ -1,4 +1,5 @@
 import { NextResponse, NextRequest } from "next/server";
+import { cookies } from 'next/headers';
 import { sunoApi } from "@/lib/SunoApi";
 import { corsHeaders } from "@/lib/utils";
 
@@ -19,7 +20,9 @@ export async function GET(req: NextRequest) {
         });
       }
 
-      const audioInfo = await (await sunoApi()).getClip(clipId);
+      const customCookie = req.headers.get('x-suno-cookie');
+      const cookieStr = customCookie || (await cookies()).toString();
+      const audioInfo = await (await sunoApi(cookieStr)).getClip(clipId);
 
       return new NextResponse(JSON.stringify(audioInfo), {
         status: 200,
