@@ -21,7 +21,9 @@ export async function GET(req: NextRequest) {
         });
       }
 
-      const lyricAlignment = await (await sunoApi((await cookies()).toString())).getLyricAlignment(song_id);
+      const customCookie = req.headers.get('x-suno-cookie');
+      const cookieStr = customCookie || (await cookies()).toString();
+      const lyricAlignment = await (await sunoApi(cookieStr)).getLyricAlignment(song_id);
 
 
       return new NextResponse(JSON.stringify(lyricAlignment), {

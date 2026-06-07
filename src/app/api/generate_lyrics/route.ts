@@ -11,7 +11,9 @@ export async function POST(req: NextRequest) {
       const body = await req.json();
       const { prompt } = body;
 
-      const lyrics = await (await sunoApi((await cookies()).toString())).generateLyrics(prompt);
+      const customCookie = req.headers.get('x-suno-cookie');
+      const cookieStr = customCookie || (await cookies()).toString();
+      const lyrics = await (await sunoApi(cookieStr)).generateLyrics(prompt);
 
       return new NextResponse(JSON.stringify(lyrics), {
         status: 200,

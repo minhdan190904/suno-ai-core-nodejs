@@ -21,7 +21,9 @@ export async function POST(req: NextRequest) {
         });
       }
 
-      const audioInfo = await (await sunoApi((await cookies()).toString()))
+      const customCookie = req.headers.get('x-suno-cookie');
+      const cookieStr = customCookie || (await cookies()).toString();
+      const audioInfo = await (await sunoApi(cookieStr))
         .extendAudio(audio_id, prompt, continue_at, tags || '', negative_tags || '', title, model || DEFAULT_MODEL, wait_audio || false);
 
       return new NextResponse(JSON.stringify(audioInfo), {

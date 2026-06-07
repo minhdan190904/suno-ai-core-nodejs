@@ -19,7 +19,9 @@ export async function POST(req: NextRequest) {
           }
         });
       }
-      const audioInfo = await (await sunoApi((await cookies()).toString())).concatenate(clip_id);
+      const customCookie = req.headers.get('x-suno-cookie');
+      const cookieStr = customCookie || (await cookies()).toString();
+      const audioInfo = await (await sunoApi(cookieStr)).concatenate(clip_id);
       return new NextResponse(JSON.stringify(audioInfo), {
         status: 200,
         headers: {

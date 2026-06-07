@@ -11,7 +11,8 @@ export async function GET(req: NextRequest) {
       const url = new URL(req.url);
       const songIds = url.searchParams.get('ids');
       const page = url.searchParams.get('page');
-      const cookie = (await cookies()).toString();
+      const customCookie = req.headers.get('x-suno-cookie');
+      const cookie = customCookie || (await cookies()).toString();
 
       let audioInfo = [];
       if (songIds && songIds.length > 0) {
