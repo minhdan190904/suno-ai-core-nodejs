@@ -10,6 +10,7 @@ const nextConfig = {
   experimental: {
     serverMinification: false, // the server minification unfortunately breaks the selector class names
   },
+  outputFileTracingRoot: '/opt/suno-api',
 };  
 
 export default nextConfig;
