@@ -81,6 +81,10 @@ class SunoApi {
   private solver = new Solver(process.env.TWOCAPTCHA_KEY + '');
   private ghostCursorEnabled = yn(process.env.BROWSER_GHOST_CURSOR, { default: false });
   private cursor?: Cursor;
+  // Token được lưu sau pre-warm để generate() dùng lại mà không cở browser
+  private cachedCaptchaToken?: string;
+  private cachedCaptchaTokenAt?: number; // timestamp ms
+  private static TOKEN_TTL_MS = 4 * 60 * 1000; // hCaptcha token hết hạn sau ~5 phút, dùng 4 phút cho an toàn
 
   constructor(cookies: string) {
     this.userAgent = new UserAgent(/Macintosh/).random().toString(); // Usually Mac systems get less amount of CAPTCHAs
@@ -200,7 +204,7 @@ class SunoApi {
     return tokenResponse.data.session_id;
   }
 
-  private async captchaRequired(): Promise<boolean> {
+  public async captchaRequired(): Promise<boolean> {
     const resp = await this.client.post(`${SunoApi.BASE_URL}/api/c/check`, {
       ctype: 'generation'
     });
@@ -411,6 +415,22 @@ class SunoApi {
     logger.info('[getCaptcha] 🔐 Bắt đầu quy trình xác minh CAPTCHA');
     logger.info('[getCaptcha] Thời điểm bắt đầu: ' + new Date().toISOString());
     logger.info('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+
+    // ✔ Kiểm tra token đã pre-warm trước đó còn hiệu lực không (< 4 phút)
+    if (this.cachedCaptchaToken && this.cachedCaptchaTokenAt) {
+      const age = Date.now() - this.cachedCaptchaTokenAt;
+      if (age < SunoApi.TOKEN_TTL_MS) {
+        logger.info(`[getCaptcha] ⚡ Dùng cached token từ pre-warm (${Math.round(age/1000)}s tuổi, còn hiệu lực ${Math.round((SunoApi.TOKEN_TTL_MS - age)/1000)}s). Bỏ qua browser!`);
+        const token = this.cachedCaptchaToken;
+        this.cachedCaptchaToken = undefined; // dùng 1 lần rồi xóa
+        this.cachedCaptchaTokenAt = undefined;
+        return token;
+      } else {
+        logger.info(`[getCaptcha] ⏰ Cached token đã hết hạn (${Math.round(age/1000)}s tuổi). Tiếp tục giải CAPTCHA mới...`);
+        this.cachedCaptchaToken = undefined;
+        this.cachedCaptchaTokenAt = undefined;
+      }
+    }
 
     logger.info('[getCaptcha] [1/10] Kiểm tra xem có cần CAPTCHA không (/api/c/check)...');
     const checkStart = Date.now();
@@ -946,6 +966,16 @@ class SunoApi {
    * @param wait_audio Indicates if the method should wait for the audio file to be fully generated before returning.
    * @returns
    */
+  /**
+   * Lưu token CAPTCHA đã giải (từ pre-warm) vào instance để generate() dùng lại.
+   * Token chỉ có hiệu lực trong TOKEN_TTL_MS (4 phút).
+   */
+  public setCaptchaToken(token: string): void {
+    this.cachedCaptchaToken = token;
+    this.cachedCaptchaTokenAt = Date.now();
+    logger.info(`[setCaptchaToken] ✅ Token pre-warm đã lưu (hết hạn sau ${SunoApi.TOKEN_TTL_MS / 1000}s)`);
+  }
+
   public async generate(
     prompt: string,
     make_instrumental: boolean = false,
