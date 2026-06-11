@@ -23,6 +23,9 @@ export default function StudioPage() {
   const [credits, setCredits] = useState<number | null>(null);
   const [pollingIds, setPollingIds] = useState<Set<string>>(new Set());
   const [error, setError] = useState('');
+  const [lyricsPrompt, setLyricsPrompt] = useState('');
+  const [lyricsLoading, setLyricsLoading] = useState(false);
+  const [showLyricsAI, setShowLyricsAI] = useState(false);
 
   // Fetch credits on mount
   useEffect(() => {
@@ -120,6 +123,26 @@ export default function StudioPage() {
     }
   }, [mode, prompt, lyrics, tags, title, instrumental]);
 
+  const handleGenerateLyrics = useCallback(async () => {
+    if (!lyricsPrompt.trim()) return;
+    setLyricsLoading(true);
+    try {
+      const res = await fetch('/api/generate_lyrics', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt: lyricsPrompt.trim() }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      const text = data?.text || data?.lyrics || JSON.stringify(data);
+      setLyrics(text);
+      setShowLyricsAI(false);
+    } catch (e: any) {
+      setError('❌ Không tạo được lyrics: ' + e.message);
+    } finally {
+      setLyricsLoading(false);
+    }
+  }, [lyricsPrompt]);
 
   const pendingCount = pollingIds.size;
 
@@ -251,9 +274,51 @@ export default function StudioPage() {
               </div>
 
               <div>
-                <label className="block text-sm font-medium text-white/70 mb-2">
-                  Lời bài hát <span className="text-indigo-400">*</span>
-                </label>
+                {/* Lyrics label + AI button */}
+                <div className="flex items-center justify-between mb-2">
+                  <label className="text-sm font-medium text-white/70">
+                    Lời bài hát <span className="text-indigo-400">*</span>
+                  </label>
+                  <button
+                    onClick={() => setShowLyricsAI(!showLyricsAI)}
+                    className="flex items-center gap-1.5 px-3 py-1 rounded-lg bg-purple-500/15 border border-purple-500/30 text-purple-300 text-xs font-medium hover:bg-purple-500/25 transition-all duration-150"
+                  >
+                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09z"/>
+                    </svg>
+                    ✨ AI viết lyrics
+                  </button>
+                </div>
+
+                {/* AI Lyrics generator panel */}
+                {showLyricsAI && (
+                  <div className="mb-3 p-3 rounded-xl bg-purple-500/10 border border-purple-500/20">
+                    <p className="text-xs text-purple-300/70 mb-2">Mô tả nội dung lyrics bạn muốn AI viết:</p>
+                    <div className="flex gap-2">
+                      <input
+                        type="text"
+                        value={lyricsPrompt}
+                        onChange={e => setLyricsPrompt(e.target.value)}
+                        onKeyDown={e => e.key === 'Enter' && handleGenerateLyrics()}
+                        placeholder="Vd: bài hát buồn về tình yêu xa cách, tiếng Việt..."
+                        className="flex-1 bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-white placeholder-white/25 focus:outline-none focus:border-purple-500/50 text-xs"
+                      />
+                      <button
+                        onClick={handleGenerateLyrics}
+                        disabled={lyricsLoading || !lyricsPrompt.trim()}
+                        className="px-4 py-2 rounded-lg bg-purple-600 hover:bg-purple-500 disabled:bg-purple-600/40 disabled:cursor-not-allowed text-white text-xs font-medium transition-all flex items-center gap-1.5 flex-shrink-0"
+                      >
+                        {lyricsLoading ? (
+                          <><svg className="w-3.5 h-3.5 animate-spin" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>Đang viết...</>
+                        ) : (
+                          <>✨ Tạo</>
+                        )}
+                      </button>
+                    </div>
+                    <p className="text-xs text-purple-300/40 mt-1.5">💡 Miễn phí, không tốn credits nhạc</p>
+                  </div>
+                )}
+
                 <textarea
                   value={lyrics}
                   onChange={e => setLyrics(e.target.value)}
