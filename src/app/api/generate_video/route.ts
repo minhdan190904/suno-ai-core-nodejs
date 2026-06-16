@@ -179,9 +179,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         }
 
         // 5. Run FFmpeg (Pure Vertical 9:16 - No Effects)
-        const filterComplex = `[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920[bg];[bg]subtitles=${assFileName}[outv]`;
+        const filterComplex = `[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920[bg]; [bg]subtitles=${assPath}[outv]`;
         
-        const ffmpegCmd = `ffmpeg -y -loop 1 -t ${duration + 2} -i "${coverImgPath}" -i "${audioUrl}" -filter_complex "${filterComplex}" -map "[outv]" -map 1:a -c:v libx264 -preset veryfast -r 24 -pix_fmt yuv420p -c:a aac -b:a 192k -shortest "${mp4FileName}"`;
+        const ffmpegCmd = `ffmpeg -y -loop 1 -t ${duration} -i "${coverImgPath}" -i "${audioUrl}" -filter_complex "${filterComplex}" -map "[outv]" -map 1:a -c:v libx264 -preset ultrafast -r 15 -pix_fmt yuv420p -c:a aac -b:a 192k -shortest "${outputPath}"`;
 
         console.log(`[FFmpeg] Executing command: ${ffmpegCmd}`);
         try {
