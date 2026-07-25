@@ -73,7 +73,7 @@ export async function POST(req: NextRequest) {
     const numWords = Math.floor(Math.random() * 2) + 4; // 4 to 5 words
     const randomPrompt = Array.from({ length: numWords }, () => keywords[Math.floor(Math.random() * keywords.length)]).join(" ");
     
-    console.log([PreWarm] Dùng prompt ngẫu nhiên: "${randomPrompt}");
+    console.log(`[PreWarm] Dùng prompt ngẫu nhiên: "${randomPrompt}"`);
     await api.generate(randomPrompt, false, undefined, false);
 
     console.log('[PreWarm] ✅ Xong! Suno đã xóa CAPTCHA cả ngày cho account này.');
