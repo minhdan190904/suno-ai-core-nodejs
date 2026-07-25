@@ -62,7 +62,19 @@ export async function POST(req: NextRequest) {
     // → giải hCaptcha → submit thật → Suno xóa captchaRequired cả ngày
     // wait_audio=false: không chờ bài hát xong
     console.log('[PreWarm] Đang generate dummy để Suno xác nhận CAPTCHA...');
-    await api.generate('', false, undefined, false);
+    
+    // Tạo prompt ngẫu nhiên từ danh sách từ khóa
+    const keywords = [
+      "flowers", "toy", "ocean", "mountain", "sky", "bird", "dream", "star", 
+      "moon", "light", "shadow", "wind", "rain", "fire", "ice", "stone", 
+      "river", "forest", "tree", "leaf", "song", "dance", "smile", "tears", 
+      "heart", "soul", "mind", "journey", "path", "memory", "future", "past"
+    ];
+    const numWords = Math.floor(Math.random() * 2) + 4; // 4 to 5 words
+    const randomPrompt = Array.from({ length: numWords }, () => keywords[Math.floor(Math.random() * keywords.length)]).join(" ");
+    
+    console.log([PreWarm] Dùng prompt ngẫu nhiên: "${randomPrompt}");
+    await api.generate(randomPrompt, false, undefined, false);
 
     console.log('[PreWarm] ✅ Xong! Suno đã xóa CAPTCHA cả ngày cho account này.');
     return new NextResponse(JSON.stringify({
