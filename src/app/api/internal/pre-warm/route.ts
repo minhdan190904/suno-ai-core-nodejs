@@ -87,7 +87,7 @@ export async function POST(req: NextRequest) {
     });
 
   } catch (error: any) {
-    console.error('[PreWarm] ❌ Thất bại:', error?.message);
+    console.error('[PreWarm] ❌ Thất bại:', error?.response?.data ? JSON.stringify(error.response.data) : error?.message);
     return new NextResponse(JSON.stringify({
       success: false,
       error: error?.message || 'Unknown error'
