@@ -839,6 +839,11 @@ class SunoApi {
             logger.info('[getCaptcha:loop] ✅ Đã có Token Turnstile từ 2Captcha, trả về trực tiếp mà không cần inject!');
             browserCtx.browser()?.close();
             controller.abort();
+            
+            if (captcha.data) {
+                this.setCaptchaToken(captcha.data); // Caching it for prewarm route logic!
+            }
+
             if (resolveTokenPromise) resolveTokenPromise(captcha.data);
             resolve(captcha.data);
             return;
@@ -987,6 +992,11 @@ class SunoApi {
           logger.info(`[getCaptcha] Tổng thời gian: ${totalElapsed}ms (${Math.round(totalElapsed/1000)}s)`);
           logger.info(`[getCaptcha] Số round đã giải: ${challengeRound}`);
           logger.info('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+          
+          if (token) {
+              this.setCaptchaToken(token); // Caching it for prewarm route logic!
+          }
+
           resolve(token ?? null);
         } catch(err: any) {
           logger.error('[getCaptcha] ❌ Lỗi khi extract token từ intercepted request: ' + err.message);
