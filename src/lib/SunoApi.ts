@@ -84,7 +84,7 @@ class SunoApi {
   // Token được lưu sau pre-warm để generate() dùng lại mà không cở browser
   private cachedCaptchaToken?: string;
   private cachedCaptchaTokenAt?: number; // timestamp ms
-  private static TOKEN_TTL_MS = 4 * 60 * 1000; // hCaptcha token hết hạn sau ~5 phút, dùng 4 phút cho an toàn
+  private static TOKEN_TTL_MS = 2 * 60 * 1000; // Cloudflare Turnstile token có TTL ngắn hơn hCaptcha (~2-3 phút)
 
   constructor(cookies: string) {
     this.userAgent = new UserAgent(/Macintosh/).random().toString(); // Usually Mac systems get less amount of CAPTCHAs
@@ -406,7 +406,9 @@ class SunoApi {
   }
 
   /**
-   * Checks for CAPTCHA verification and solves the CAPTCHA if needed
+   * Checks for CAPTCHA verification and solves the CAPTCHA if needed.
+   * Suno uses hCaptcha for generate actions (served from hcaptcha-assets-prod.suno.com).
+   * Cloudflare Turnstile handles page-level auth (passes automatically via Clerk).
    * @returns {string|null} hCaptcha token. If no verification is required, returns null
    */
   public async getCaptcha(): Promise<string|null> {
@@ -422,17 +424,17 @@ class SunoApi {
       if (age < SunoApi.TOKEN_TTL_MS) {
         logger.info(`[getCaptcha] ⚡ Dùng cached token từ pre-warm (${Math.round(age/1000)}s tuổi, còn hiệu lực ${Math.round((SunoApi.TOKEN_TTL_MS - age)/1000)}s). Bỏ qua browser!`);
         const token = this.cachedCaptchaToken;
-        this.cachedCaptchaToken = undefined; // dùng 1 lần rồi xóa
+        this.cachedCaptchaToken = undefined;
         this.cachedCaptchaTokenAt = undefined;
         return token;
       } else {
-        logger.info(`[getCaptcha] ⏰ Cached token đã hết hạn (${Math.round(age/1000)}s tuổi). Tiếp tục giải CAPTCHA mới...`);
+        logger.info(`[getCaptcha] ⏰ Cached token đã hết hạn (${Math.round(age/1000)}s tuổi). Tiếp tục lấy token mới...`);
         this.cachedCaptchaToken = undefined;
         this.cachedCaptchaTokenAt = undefined;
       }
     }
 
-    logger.info('[getCaptcha] [1/10] Kiểm tra xem có cần CAPTCHA không (/api/c/check)...');
+    logger.info('[getCaptcha] [1/6] Kiểm tra xem có cần CAPTCHA không (/api/c/check)...');
     const checkStart = Date.now();
     const captchaNeeded = await this.captchaRequired();
     logger.info(`[getCaptcha] Kết quả kiểm tra: captchaRequired=${captchaNeeded} (${Date.now() - checkStart}ms)`);
@@ -440,17 +442,17 @@ class SunoApi {
       logger.info('[getCaptcha] ✅ Không cần CAPTCHA, bỏ qua browser flow. Tổng thời gian: ' + (Date.now() - captchaStartMs) + 'ms');
       return null;
     }
-    logger.info('[getCaptcha] ⚠️  CAPTCHA BẮT BUỘC — Sẽ mở browser Playwright để giải...');
+    logger.info('[getCaptcha] ⚠️  CAPTCHA BẮT BUỘC — Sẽ mở browser Playwright để giải hCaptcha...');
 
-    logger.info('[getCaptcha] [2/10] Khởi động browser Playwright...');
+    logger.info('[getCaptcha] [2/6] Khởi động browser Playwright...');
     const browserLaunchStart = Date.now();
-    const browser = await this.launchBrowser();
-    const page = await browser.newPage();
+    const browserCtx = await this.launchBrowser();
+    const page = await browserCtx.newPage();
     logger.info(`[getCaptcha] ✅ Browser đã khởi động (${Date.now() - browserLaunchStart}ms). UserAgent: ${this.userAgent?.substring(0, 60)}...`);
 
     // Override User-Agent Client Hints at network level via CDP to hide HeadlessChrome
     try {
-      const cdpSession = await browser.newCDPSession(page);
+      const cdpSession = await browserCtx.newCDPSession(page);
       await cdpSession.send('Network.setUserAgentOverride', {
         userAgent: this.userAgent!,
         userAgentMetadata: {
@@ -479,31 +481,40 @@ class SunoApi {
       logger.warn('[getCaptcha] CDP Client Hints override failed: ' + e.message);
     }
 
-    // Callback shared giữa CSP handler và tokenPromise
-    // Khi CSP handler phát hiện URL /api/generate/v2 → gọi callback này thay vì fetch()
+    // Shared callback: called by CSP handler when /api/generate/v2 is intercepted
     let onGenerateIntercepted: ((route: any) => void) | null = null;
 
-    // Strip CSP/COEP headers from Suno and hCaptcha pages to allow hCaptcha SDK + service worker
+    // Strip CSP/COEP headers from Suno pages to allow hCaptcha iframe embedding.
+    // CRITICAL rules:
+    //   1. DO NOT intercept hCaptcha/captcha resources — they must load freely from
+    //      hcaptcha-assets-prod.suno.com (route.fetch() fails in iframe context = ERR_ABORTED)
+    //   2. DO NOT intercept challenges.cloudflare.com — Turnstile must work freely
+    //   3. DO intercept /api/generate/v2 to capture the hCaptcha token
     const stripCspHandler = async (route: any) => {
       const url = route.request().url();
 
-      // *** CRITICAL FIX ***
-      // Nếu URL là /api/generate/v2 → KHÔNG fetch, ABORT ngay!
-      // Đây là request tạo bài hát "Lorem ipsum" mà ta cần chặn.
-      // page.route() luôn ưu tiên hơn context.route() trong Playwright,
-      // nên phải xử lý ngay trong đây.
+      // *** PRIORITY 1: Intercept generate/v2 to capture hCaptcha token ***
       if (url.includes('/api/generate/v2')) {
         logger.info(`[getCaptcha:CSP] 🎯 CHẶN request generate/v2: ${url.substring(0, 100)}`);
         if (onGenerateIntercepted) {
           onGenerateIntercepted(route);
         } else {
-          // Callback chưa sẵn sàng (race condition rất hiếm) — abort trực tiếp
           logger.warn('[getCaptcha:CSP] onGenerateIntercepted chưa sẵn sàng, abort trực tiếp.');
           await route.abort();
         }
         return;
       }
 
+      // *** PRIORITY 2: Pass hCaptcha resources through WITHOUT route.fetch() ***
+      // hCaptcha is now served from hcaptcha-assets-prod.suno.com (Suno's own CDN).
+      // Calling route.fetch() for these iframe resources fails with ERR_ABORTED.
+      // Must use route.continue() instead to let them load freely.
+      if (url.includes('hcaptcha') || url.includes('/captcha/')) {
+        try { await route.continue(); } catch { /* ignore — request may already be gone */ }
+        return;
+      }
+
+      // *** PRIORITY 3: Strip CSP headers from Suno pages ***
       try {
         const response = await route.fetch();
         const headers = { ...response.headers() };
@@ -525,10 +536,13 @@ class SunoApi {
         await route.continue();
       }
     };
+    // Route Suno pages for CSP stripping + generate interception.
+    // DO NOT route challenges.cloudflare.com (Turnstile must work freely).
     await page.route('https://suno.com/**', stripCspHandler);
     await page.route('https://*.suno.com/**', stripCspHandler);
-    await page.route('https://*.hcaptcha.com/**', stripCspHandler);
-    logger.info('[getCaptcha] CSP stripping routes registered for suno.com + subdomains + hcaptcha.com');
+    logger.info('[getCaptcha] Routes đã đăng ký:');
+    logger.info('[getCaptcha]   • suno.com/** + *.suno.com/** → CSP strip (trừ hcaptcha URLs → continue)');
+    logger.info('[getCaptcha]   • challenges.cloudflare.com → KHÔNG route (Turnstile tự do)');
     logger.info('[getCaptcha] ✅ Generate/v2 interception tích hợp trong CSP handler.');
 
     // ── Verbose browser event logging ──
@@ -537,10 +551,15 @@ class SunoApi {
       const text = msg.text();
       if (type === 'error') logger.error('[browser:console:ERROR] ' + text);
       else if (type === 'warning' || type === 'warn') logger.warn('[browser:console:WARN] ' + text);
-      else logger.info('[browser:console:' + type.toUpperCase() + '] ' + text);
     });
     page.on('pageerror', err => logger.error('[browser:pageerror] ❌ ' + err.message));
-    page.on('requestfailed', req => logger.warn('[browser:requestfailed] ⚠️  ' + req.method() + ' ' + req.url().substring(0, 120) + ' -> ' + req.failure()?.errorText));
+    page.on('requestfailed', req => {
+      const failUrl = req.url();
+      // Only log failures from important domains, skip Cloudflare Turnstile noise
+      if (!failUrl.includes('challenges.cloudflare.com') && !failUrl.includes('hagen.challenges')) {
+        logger.warn('[browser:requestfailed] ⚠️  ' + req.method() + ' ' + failUrl.substring(0, 120) + ' -> ' + req.failure()?.errorText);
+      }
+    });
     page.on('framenavigated', frame => {
       if (frame === page.mainFrame()) {
         logger.info('[browser:navigation] 🔀 Trang chuyển sang: ' + frame.url().substring(0, 150));
@@ -549,28 +568,26 @@ class SunoApi {
     page.on('response', resp => {
       const url = resp.url();
       const status = resp.status();
-      // Chỉ log các API quan trọng
       if (url.includes('/api/c/check') || url.includes('/api/project') ||
           url.includes('/api/generate') || url.includes('clerk') ||
-          url.includes('hcaptcha')) {
+          url.includes('hcaptcha') || url.includes('turnstile')) {
         const emoji = status >= 400 ? '❌' : '✅';
         logger.info(`[browser:response] ${emoji} ${status} ${resp.request().method()} ${url.substring(0, 140)}`);
       }
     });
 
-    logger.info('[getCaptcha] [3/10] Điều hướng đến https://suno.com/create ...');
+    logger.info('[getCaptcha] [3/6] Điều hướng đến https://suno.com/create ...');
     const gotoStart = Date.now();
     try {
       await page.goto('https://suno.com/create', { referer: 'https://www.google.com/', waitUntil: 'domcontentloaded', timeout: 0 });
       logger.info(`[getCaptcha] ✅ Trang đã tải (domcontentloaded) sau ${Date.now() - gotoStart}ms`);
       logger.info('[getCaptcha] URL hiện tại: ' + page.url());
-      logger.info('[getCaptcha] Tiêu đề trang: ' + await page.title().catch(() => '(không lấy được)'));
     } catch (e: any) {
       logger.error('[getCaptcha] ❌ page.goto thất bại sau ' + (Date.now() - gotoStart) + 'ms: ' + e.message);
       throw e;
     }
 
-    logger.info('[getCaptcha] [4/10] Chờ Suno project API response (**/api/project/**) — tối đa 60s...');
+    logger.info('[getCaptcha] [4/6] Chờ Suno project API response (**/api/project/**) — tối đa 60s...');
     const projectApiStart = Date.now();
     try {
       const projectResp = await page.waitForResponse('**/api/project/**\\?**', { timeout: 60000 });
@@ -578,7 +595,7 @@ class SunoApi {
       logger.info('[getCaptcha] Project API status: ' + projectResp.status() + ' | URL: ' + projectResp.url().substring(0, 120));
       logger.info('[getCaptcha] Giao diện Suno đã sẵn sàng.');
     } catch (e: any) {
-      logger.error(`[getCaptcha] ❌ waitForResponse(**/api/project/**) timeout sau ${Date.now() - projectApiStart}ms: ` + e.message);
+      logger.error(`[getCaptcha] ❌ waitForResponse timeout sau ${Date.now() - projectApiStart}ms: ` + e.message);
       try {
         const screenshotPath = path.join(process.cwd(), 'public', 'debug-project-api-timeout.png');
         await page.screenshot({ path: screenshotPath, fullPage: true });
@@ -589,122 +606,82 @@ class SunoApi {
       throw e;
     }
 
-    // FIX: Wait for Clerk handshake navigation to fully settle before touching DOM.
-    // After the project API response, Suno/Clerk may perform an auth redirect
-    // (?__clerk_handshake=...) which destroys the current Playwright execution context.
-    logger.info('[getCaptcha] [5/10] Chờ trang ổn định sau Clerk handshake auth...');
+    // Wait for page to stabilize after Clerk handshake
+    logger.info('[getCaptcha] [5/6] Chờ trang ổn định...');
     const settleStart = Date.now();
     try {
       await page.waitForLoadState('domcontentloaded', { timeout: 10000 });
-      logger.info(`[getCaptcha] domcontentloaded OK sau ${Date.now() - settleStart}ms`);
-    } catch (e: any) {
-      logger.warn('[getCaptcha] domcontentloaded timeout, tiếp tục: ' + e.message);
-    }
+    } catch { /* ignore timeout */ }
     const currentUrl = page.url();
-    logger.info('[getCaptcha] URL sau project API: ' + currentUrl);
-    const hasClerkHandshake = currentUrl.includes('__clerk_handshake');
-    const hasClerkInUrl = currentUrl.includes('clerk');
-    logger.info(`[getCaptcha] Clerk handshake trong URL: ${hasClerkHandshake} | Clerk URL: ${hasClerkInUrl}`);
-    if (hasClerkHandshake || hasClerkInUrl) {
+    if (currentUrl.includes('__clerk_handshake') || currentUrl.includes('clerk')) {
       logger.info('[getCaptcha] 🔄 Phát hiện Clerk redirect, đang chờ navigation cuối cùng...');
-      logger.info('[getCaptcha] URL đầy đủ: ' + currentUrl.substring(0, 200));
       try {
-        const navStart = Date.now();
         await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 });
-        logger.info(`[getCaptcha] ✅ Navigation hoàn thành sau ${Date.now() - navStart}ms`);
-        logger.info('[getCaptcha] URL sau clerk redirect: ' + page.url());
-      } catch (e: any) {
-        logger.warn('[getCaptcha] waitForNavigation timeout, tiếp tục: ' + e.message);
-      }
+        logger.info('[getCaptcha] ✅ Navigation sau Clerk redirect hoàn thành. URL: ' + page.url());
+      } catch { /* ignore timeout */ }
     }
     await sleep(0.2, 0.3);
-    logger.info('[getCaptcha] ✅ Trang đã ổn định. URL cuối: ' + page.url());
-    logger.info(`[getCaptcha] Tiêu đề trang: ${await page.title().catch(() => '(lỗi)')}`);
-    logger.info(`[getCaptcha] Tổng thời gian settle: ${Date.now() - settleStart}ms`);
+    logger.info(`[getCaptcha] ✅ Trang ổn định sau ${Date.now() - settleStart}ms. URL: ` + page.url());
 
     if (this.ghostCursorEnabled) {
-      logger.info('[getCaptcha] Initializing ghost cursor...');
       this.cursor = await createCursor(page);
       logger.info('[getCaptcha] Ghost cursor initialized.');
     }
 
-    logger.info('[getCaptcha] [6/10] Kiểm tra và đóng popup...');
+    // Close any popup
     try {
       const closeButtons = page.getByLabel('Close');
       const closeCount = await closeButtons.count().catch(() => 0);
-      logger.info(`[getCaptcha] Số nút Close tìm thấy: ${closeCount}`);
       if (closeCount > 0) {
-        for (let i = 0; i < closeCount; i++) {
-          const btn = closeButtons.nth(i);
-          const ariaLabel = await btn.getAttribute('aria-label').catch(() => '?');
-          logger.info(`[getCaptcha] Nút Close #${i+1}: aria-label="${ariaLabel}"`);
-        }
         await closeButtons.first().click({ timeout: 2000 });
         logger.info('[getCaptcha] ✅ Đã đóng popup.');
-      } else {
-        logger.info('[getCaptcha] Không có popup nào cần đóng.');
       }
-    } catch(e: any) {
-      logger.info('[getCaptcha] Không đóng được popup (hoặc timeout): ' + e.message);
-    }
+    } catch { /* ignore */ }
 
-    // FIX: Retry textarea finding up to 3 times to handle "Execution context was destroyed"
-    // caused by post-auth navigation events
-    logger.info('[getCaptcha] Locating visible textarea element...');
+    // Wait for textarea to be ready
+    logger.info('[getCaptcha] [6/6] Tìm textarea và click Create để trigger Turnstile...');
     const textarea = page.locator('textarea:visible');
-    let textareaReady = false;
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
-        const count = await textarea.count();
-        logger.info(`[getCaptcha] Visible textarea count (attempt ${attempt}/3): ${count}`);
-        logger.info('[getCaptcha] Waiting for visible textarea (timeout=15000ms)...');
         await textarea.waitFor({ state: 'visible', timeout: 15000 });
-        logger.info('[getCaptcha] Textarea is visible. Clicking...');
-        textareaReady = true;
+        logger.info(`[getCaptcha] ✅ Textarea visible (attempt ${attempt}/3)`);
         break;
       } catch (e: any) {
         const isNavError = e.message.includes('Execution context was destroyed')
           || e.message.includes('navigation')
           || e.message.includes('detached');
         if (isNavError && attempt < 3) {
-          logger.info(`[getCaptcha] Navigation detected during textarea wait (attempt ${attempt}/3), waiting for page to re-settle...`);
-          try {
-            await page.waitForLoadState('domcontentloaded', { timeout: 15000 });
-          } catch (_) {}
+          try { await page.waitForLoadState('domcontentloaded', { timeout: 15000 }); } catch (_) {}
           await sleep(0.5, 1);
-          logger.info('[getCaptcha] Retrying textarea search. Current URL: ' + page.url());
         } else {
-          logger.error('[getCaptcha] Visible textarea not found after ' + attempt + ' attempt(s): ' + e.message);
-          // Dump page HTML for diagnosis
+          // Save debug info
           try {
             const html = await page.content();
-            const htmlPath = path.join(process.cwd(), 'public', 'debug-page-content.html');
-            await fs.writeFile(htmlPath, html);
-            logger.info('[getCaptcha] Page HTML dumped to: ' + htmlPath);
-          } catch (htmlErr: any) {
-            logger.warn('[getCaptcha] Could not dump page HTML: ' + htmlErr.message);
-          }
+            await fs.writeFile(path.join(process.cwd(), 'public', 'debug-page-content.html'), html);
+          } catch { /* ignore */ }
           try {
-            const screenshotPath = path.join(process.cwd(), 'public', 'debug-textarea-not-found.png');
-            await page.screenshot({ path: screenshotPath, fullPage: true });
-            logger.info('[getCaptcha] Debug screenshot saved to: ' + screenshotPath);
-          } catch (ssErr: any) {
-            logger.warn('[getCaptcha] Could not save screenshot: ' + ssErr.message);
-          }
+            await page.screenshot({ path: path.join(process.cwd(), 'public', 'debug-textarea-not-found.png'), fullPage: true });
+          } catch { /* ignore */ }
           throw e;
         }
       }
     }
 
-    logger.info('[getCaptcha] [8/10] Click textarea và nhập text mồi ("Lorem ipsum")...');
-    const textareaBox = await textarea.boundingBox().catch(() => null);
-    logger.info('[getCaptcha] Textarea bounding box: ' + JSON.stringify(textareaBox));
     await this.click(textarea);
-    logger.info('[getCaptcha] ✅ Đã click textarea.');
-    await textarea.pressSequentially('Lorem ipsum', { delay: 20 });
-    logger.info('[getCaptcha] ✅ Đã nhập "Lorem ipsum" vào textarea. (Đây là text MỒI để trigger hCaptcha, không phải prompt thật)');
+    const dummyPrompts = [
+      'A beautiful pop song about a sunny day',
+      'Epic orchestral battle music',
+      'Lo-fi hip hop beats to relax to',
+      'An upbeat electronic dance track',
+      'A sad acoustic song about heartbreak',
+      'A rock song about driving on the highway',
+      'Soothing jazz for late night studying'
+    ];
+    const randomPrompt = dummyPrompts[Math.floor(Math.random() * dummyPrompts.length)];
+    await textarea.pressSequentially(randomPrompt, { delay: 20 });
+    logger.info(`[getCaptcha] ✅ Đã nhập text mồi vào textarea: "${randomPrompt}"`);
 
-    logger.info('[getCaptcha] [9/10] Tìm nút Create để trigger hCaptcha...');
+    // Click Create button — this triggers hCaptcha challenge
     const button = page.locator('button[aria-label*="Create"]');
     try {
       const btnCount = await button.count();
@@ -721,80 +698,163 @@ class SunoApi {
     await this.click(button);
     logger.info('[getCaptcha] ✅ Đã click nút Create. hCaptcha sẽ xuất hiện...');
 
-    // OPT: Chờ hCaptcha iframe xuất hiện bằng src URL (title không chứa "hCaptcha")
-    logger.info('[getCaptcha] Chờ hCaptcha iframe xuất hiện (tối đa 5s)...');
-    const iframeStart = Date.now();
+    // Log frames + screenshot after clicking to verify hCaptcha appears
+    await sleep(1.5, 2);
     try {
-      await page.waitForSelector('iframe[src*="hcaptcha"]', { timeout: 5000 });
-      logger.info(`[getCaptcha] ✅ hCaptcha iframe xuất hiện sau ${Date.now() - iframeStart}ms`);
-    } catch (e: any) {
-      logger.warn(`[getCaptcha] hCaptcha iframe chưa xuất hiện sau 5s, tiếp tục... (${e.message.substring(0, 60)})`);
-    }
-    try {
+      const allFramesPostClick = page.frames();
+      const hcaptchaFrames = allFramesPostClick.filter((f: any) => f.url().includes('hcaptcha'));
+      const turnstileFrames = allFramesPostClick.filter((f: any) => f.url().includes('challenges.cloudflare.com'));
+      logger.info(`[getCaptcha] Frames sau click Create: total=${allFramesPostClick.length}, hcaptcha=${hcaptchaFrames.length}, turnstile=${turnstileFrames.length}`);
+      allFramesPostClick.forEach((f: any, i: number) => logger.info(`  Frame #${i}: ${f.url().substring(0, 120)}`));
       const debugPath = path.join(process.cwd(), 'public', 'debug-after-create-click.png');
       await page.screenshot({ path: debugPath, fullPage: true });
       logger.info('[getCaptcha] 📸 Screenshot sau click Create: ' + debugPath);
-      const allFrames = page.frames();
-      logger.info(`[getCaptcha] Tổng số frames trên trang: ${allFrames.length}`);
-      const hcaptchaFrames = allFrames.filter((f: any) => f.url().includes('hcaptcha'));
-      logger.info(`[getCaptcha] Số hCaptcha iframe: ${hcaptchaFrames.length}`);
-      if (hcaptchaFrames.length === 0) {
-        logger.warn('[getCaptcha] ⚠️  KHÔNG tìm thấy hCaptcha iframe! Có thể Suno không yêu cầu captcha lần này.');
-        logger.info('[getCaptcha] Danh sách tất cả frames:');
-        allFrames.forEach((f: any, i: number) => logger.info(`  Frame #${i}: ${f.url().substring(0, 120)}`));
-      } else {
-        hcaptchaFrames.forEach((f: any, i: number) => {
-          logger.info(`[getCaptcha] hCaptcha frame #${i+1}: ${f.url().substring(0, 200)}`);
-        });
-      }
     } catch (ssErr: any) {
-      logger.warn('[getCaptcha] Debug screenshot thất bại: ' + ssErr.message);
+      logger.warn('[getCaptcha] Debug info thất bại: ' + ssErr.message);
     }
 
     const controller = new AbortController();
     const challengeStartMs = Date.now();
     logger.info('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-    logger.info('[getCaptcha] [10/10] 🤖 Bắt đầu vòng lặp giải CAPTCHA (2Captcha)...');
+    logger.info('[getCaptcha] [10/10] 🤖 Bắt đầu vòng lặp giải hCaptcha (2Captcha)...');
     logger.info('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
     let challengeRound = 0;
+    let resolveTokenPromise: (value: string | null | PromiseLike<string | null>) => void;
+    let rejectTokenPromise: (reason?: any) => void;
+    
+    // CAPTCHA solving loop — runs in parallel with tokenPromise.
+    // Handles both hCaptcha (coordinates) and Cloudflare Turnstile (token injection).
     new Promise<void>(async (resolve, reject) => {
-      const frame = page.frameLocator('iframe[title*="hCaptcha"]');
-      const challenge = frame.locator('.challenge-container');
       try {
         let wait = true;
         let firstIteration = true;
+        
         while (true) {
           if (wait) {
             if (firstIteration) {
-              logger.info('[getCaptcha:loop] ⏳ Chờ hCaptcha challenge xuất hiện (tối đa 3 phút)...');
+              logger.info('[getCaptcha:loop] ⏳ Chờ hCaptcha hoặc Turnstile challenge xuất hiện (tối đa 3 phút)...');
+              
+              // Wait until either an hCaptcha container OR a visible Turnstile iframe appears
               const waitChallengeStart = Date.now();
-              await challenge.locator('.prompt-text').first().waitFor({ state: 'visible', timeout: 180000 });
-              logger.info(`[getCaptcha:loop] ✅ Challenge đã xuất hiện sau ${Date.now() - waitChallengeStart}ms. Chờ ảnh load...`);
-              await sleep(0.3, 0.5); // OPT: giảm từ sleep(3,5) xuống 0.3-0.5s, ảnh vẫn đang load kỉ khi 2Captcha chụp screenshot
+              let foundCaptcha = false;
+              while (Date.now() - waitChallengeStart < 180000) {
+                const hasHcaptcha = await page.frameLocator('iframe[title*="hCaptcha"]').locator('.challenge-container').isVisible().catch(() => false);
+                
+                let hasTurnstile = false;
+                try {
+                  const tsFrames = page.frames().filter(f => f.url().includes('challenges.cloudflare.com'));
+                  for (const f of tsFrames) {
+                    if (f.url().match(/([0-9]x4[A-Za-z0-9_-]{15,})/)) {
+                      hasTurnstile = true; break;
+                    }
+                  }
+                } catch (e) { /* ignore */ }
+                
+                if (hasHcaptcha || hasTurnstile) {
+                  foundCaptcha = true;
+                  break;
+                }
+                await sleep(1);
+              }
+              
+              if (!foundCaptcha) {
+                logger.warn('[getCaptcha:loop] ⏰ Không thấy CAPTCHA nào xuất hiện sau 3 phút.');
+                break;
+              }
+              logger.info(`[getCaptcha:loop] ✅ Challenge đã xuất hiện sau ${Date.now() - waitChallengeStart}ms.`);
+              await sleep(0.5, 1);
               firstIteration = false;
             } else {
-              // OPT: Thêm max timeout 12s — tránh treo vô tận khi captcha đã pass
-              // (khi captcha pass, generate request đã bị abort, không có hình mới nào load)
-              logger.info('[getCaptcha:loop] Chờ hCaptcha network settle (tối đa 12s)...');
-              const settleResult = await Promise.race([
+              logger.info('[getCaptcha:loop] Chờ network settle (tối đa 12s)...');
+              await Promise.race([
                 waitForRequests(page, controller.signal),
                 new Promise<void>(r => setTimeout(r, 12000))
               ]);
-              logger.info('[getCaptcha:loop] Network settled (hoặc timeout 12s).');
             }
-            logger.info('[getCaptcha:loop] Reading challenge prompt...');
           }
           challengeRound++;
           const roundStart = Date.now();
-          const promptText = (await challenge.locator('.prompt-text').first().innerText()).toLowerCase();
-          const challengeType = promptText.includes('drag') ? 'DRAG' : 'CLICK';
-          logger.info(`[getCaptcha:loop] ── Round ${challengeRound} ─────────────────────────`);
+          
+          // Check which CAPTCHA is currently visible
+          const hFrame = page.frameLocator('iframe[title*="hCaptcha"]');
+          const isHcaptcha = await hFrame.locator('.challenge-container').isVisible().catch(() => false);
+          
+          // Find the Turnstile frame from page.frames()
+          let tsFrameObj: any = null;
+          let tsUrl: string | null = null;
+          try {
+            const tsFrames = page.frames().filter(f => f.url().includes('challenges.cloudflare.com'));
+            for (const f of tsFrames) {
+              if (f.url().match(/([0-9]x4[A-Za-z0-9_-]{15,})/)) {
+                tsFrameObj = f;
+                tsUrl = f.url();
+                break;
+              }
+            }
+          } catch(e) {}
+          const isTurnstile = !!tsFrameObj;
+          
+          if (isTurnstile) {
+            logger.info(`[getCaptcha:loop] ── Round ${challengeRound} (Cloudflare Turnstile) ───────────`);
+            logger.info('[getCaptcha:loop] 🛡️ Phát hiện Cloudflare Turnstile interactive challenge.');
+            
+            // Extract Sitekey from Turnstile iframe URL
+            // The sitekey always starts with 0x4 or 1x4, 2x4, etc., and is around 22 chars long.
+            const match = tsUrl ? tsUrl.match(/([0-9]x4[A-Za-z0-9_-]{15,})/) : null;
+            const sitekey = match ? match[1] : null;
+            
+            if (!sitekey) {
+               logger.warn('[getCaptcha:loop] ❌ Không lấy được sitekey từ URL Turnstile: ' + tsUrl);
+               // Fallback: try to find the frame and click it
+               logger.info('[getCaptcha:loop] Thử fallback bằng cách click trực tiếp vào Turnstile iframe...');
+               try {
+                  const loc = page.locator('iframe[src*="challenges.cloudflare.com"]').first();
+                  await this.click(loc);
+               } catch(e) {}
+               await sleep(5, 7);
+               wait = true;
+               firstIteration = true;
+               continue;
+            }
+            
+            logger.info(`[getCaptcha:loop] 🔑 Đã lấy được Sitekey Turnstile: ${sitekey}`);
+            logger.info('[getCaptcha:loop] 📤 Gửi request giải Turnstile lên 2Captcha...');
+            const solveStart = Date.now();
+            let captcha: any;
+            try {
+              captcha = await this.solver.cloudflareTurnstile({
+                pageurl: page.url(),
+                sitekey: sitekey,
+                action: 'generate' // Optional action parameter
+              });
+              logger.info(`[getCaptcha:loop] ✅ 2Captcha giải thành công Turnstile sau ${Date.now() - solveStart}ms`);
+              logger.info(`[getCaptcha:loop] Token length: ${captcha?.data?.length}`);
+            } catch (err: any) {
+              logger.error(`[getCaptcha:loop] ❌ 2Captcha Turnstile error: ${err.message}`);
+              wait = true;
+              firstIteration = true;
+              continue;
+            }
+            
+            logger.info('[getCaptcha:loop] ✅ Đã có Token Turnstile từ 2Captcha, trả về trực tiếp mà không cần inject!');
+            browserCtx.browser()?.close();
+            controller.abort();
+            if (resolveTokenPromise) resolveTokenPromise(captcha.data);
+            resolve(captcha.data);
+            return;
+          }
+          
+          if (isHcaptcha) {
+            const challenge = hFrame.locator('.challenge-container');
+            const promptText = (await challenge.locator('.prompt-text').first().innerText()).toLowerCase();
+            const challengeType = promptText.includes('drag') ? 'DRAG' : 'CLICK';
+            logger.info(`[getCaptcha:loop] ── Round ${challengeRound} (hCaptcha) ─────────────────────────`);
           logger.info(`[getCaptcha:loop] Loại challenge: ${challengeType}`);
           logger.info(`[getCaptcha:loop] Nội dung prompt: "${promptText}"`);
           logger.info(`[getCaptcha:loop] Thời gian kể từ lần click Create: ${Date.now() - challengeStartMs}ms`);
           const drag = promptText.includes('drag');
           let captcha: any;
-          for (let j = 0; j < 3; j++) { // try several times because sometimes 2Captcha could return an error
+          for (let j = 0; j < 3; j++) {
             try {
               logger.info(`[getCaptcha:loop] 📤 Gửi screenshot lên 2Captcha (lần ${j+1}/3)...`);
               const screenshotBuf = await challenge.screenshot({ timeout: 5000 });
@@ -804,7 +864,6 @@ class SunoApi {
                 lang: process.env.BROWSER_LOCALE
               };
               if (drag) {
-                // Say to the worker that he needs to click
                 payload.textinstructions = 'CLICK on the shapes at their edge or center as shown above—please be precise!';
                 payload.imginstructions = (await fs.readFile(path.join(process.cwd(), 'public', 'drag-instructions.jpg'))).toString('base64');
               }
@@ -822,7 +881,7 @@ class SunoApi {
               else
                 throw err;
             }
-          } 
+          }
           if (drag) {
             logger.info('[getCaptcha:loop] Drag challenge detected. Getting bounding box...');
             const challengeBox = await challenge.boundingBox();
@@ -841,7 +900,7 @@ class SunoApi {
               logger.info('[getCaptcha:loop] Drag: ' + JSON.stringify(data1) + ' -> ' + JSON.stringify(data2));
               await page.mouse.move(challengeBox.x + +data1.x, challengeBox.y + +data1.y);
               await page.mouse.down();
-              await sleep(1.1); // wait for the piece to be 'unlocked'
+              await sleep(1.1);
               await page.mouse.move(challengeBox.x + +data2.x, challengeBox.y + +data2.y, { steps: 30 });
               await page.mouse.up();
             }
@@ -857,15 +916,16 @@ class SunoApi {
           }
           logger.info(`[getCaptcha:loop] Round ${challengeRound} hoàn thành sau ${Date.now() - roundStart}ms. Đang Submit...`);
           logger.info('[getCaptcha:loop] Clicking Submit button...');
-          this.click(frame.locator('.button-submit')).catch(e => {
-            if (e.message.includes('viewport')) { // when hCaptcha window has been closed due to inactivity,
+          this.click(hFrame.locator('.button-submit')).catch(e => {
+            if (e.message.includes('viewport')) {
               logger.info('[getCaptcha:loop] Submit button out of viewport, re-clicking Create button...');
-              this.click(button); // click the Create button again to trigger the CAPTCHA
+              this.click(button);
             } else {
               throw e;
             }
           });
-        }
+          } // end isHcaptcha
+        } // end while(true)
       } catch(e: any) {
         if (e.message.includes('been closed') || e.message === 'AbortError' || e.message.includes('Timeout') || e.message.includes('Target page, context or browser has been closed')) {
           logger.info(`[getCaptcha:loop] Vòng lặp CAPTCHA kết thúc bình thường sau ${challengeRound} round(s). Lý do: ${e.message.substring(0, 80)}`);
@@ -877,26 +937,25 @@ class SunoApi {
       }
     }).catch(e => {
       logger.error('[getCaptcha] CAPTCHA Promise rejected: ' + e.message);
-      // Save crash screenshot for debugging
       try {
         const crashPath = path.join(process.cwd(), 'public', 'debug-captcha-crash.png');
         page.screenshot({ path: crashPath, fullPage: true }).catch(() => {});
       } catch {}
-      browser.browser()?.close();
-      // Graceful degradation: return null instead of crashing
+      browserCtx.browser()?.close();
       logger.warn('[getCaptcha] Captcha failed, will try generate without token (graceful fallback)');
     });
 
-    // FIX: Dùng callback thay vì context.route() vì page.route() CSP handler 
-    // luôn ưu tiên hơn context.route() trong Playwright.
-    // Callback được gọi từ bên trong stripCspHandler khi phát hiện /api/generate/v2
+    // Token is extracted from the intercepted /api/generate/v2 request that fires after hCaptcha is solved.
+    // This callback is assigned here and invoked by stripCspHandler.
     logger.info('[getCaptcha] ⏳ Đăng ký generate intercept callback...');
     const tokenWaitStart = Date.now();
 
     let timeoutId: ReturnType<typeof setTimeout> | null = null;
 
     const tokenPromise = new Promise<string|null>((resolve, reject) => {
-      // Gán callback — sẽ được gọi bởi CSP handler khi URL chứa /api/generate/v2
+      resolveTokenPromise = resolve;
+      rejectTokenPromise = reject;
+      // Gán callback — sẽ được gọi bời CSP handler khi URL chứa /api/generate/v2
       onGenerateIntercepted = async (route: any) => {
         try {
           const elapsed = Date.now() - tokenWaitStart;
@@ -905,27 +964,30 @@ class SunoApi {
           const request = route.request();
           const postData = request.postDataJSON();
           const token = postData?.token;
+          const tokenProvider = postData?.token_provider;
           const authHeader = request.headers().authorization || '';
-          // ABORT FIRST — trước mọi thứ để ngăn Suno tạo bài hát Lorem ipsum
+          // ABORT FIRST — trước mọi thứ để ngăn Suno tạo bài hát mồi
           await route.abort();
           logger.info(`[getCaptcha] ✅ ROUTE ABORTED — request KHÔNG đến Suno server!`);
+          logger.info(`[getCaptcha] Token provider: ${tokenProvider ?? '(none)'}`);
           logger.info(`[getCaptcha] Token hCaptcha: ${token ? token.substring(0, 30) + '...' : 'KHÔNG CÓ'}`);
           logger.info(`[getCaptcha] Token length: ${token?.length ?? 0} ký tự`);
           logger.info(`[getCaptcha] Authorization header: ${authHeader.substring(0, 50)}...`);
           logger.info(`[getCaptcha] Payload keys: ${Object.keys(postData || {}).join(', ')}`);
-          logger.info('[getCaptcha] Route đã abort — bài hát Lorem ipsum sẽ KHÔNG được tạo.');
+          logger.info('[getCaptcha] Route đã abort — bài hát mồi sẽ KHÔNG được tạo.');
           this.currentToken = authHeader.split('Bearer ').pop();
-          browser.browser()?.close();
+          browserCtx.browser()?.close();
           controller.abort();
           // Clear timeout to prevent misleading 'Timeout' log
           if (timeoutId) clearTimeout(timeoutId);
           const totalElapsed = Date.now() - captchaStartMs;
           logger.info('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-          logger.info(`[getCaptcha] ✅ CAPTCHA HOÀN THÀNH! Bài Lorem ipsum KHÔNG bị tạo.`);
+          logger.info(`[getCaptcha] ✅ CAPTCHA HOÀN THÀNH! Bài mồi KHÔNG bị tạo.`);
+          logger.info(`[getCaptcha] Token provider: ${tokenProvider ?? 'unknown'}`);
           logger.info(`[getCaptcha] Tổng thời gian: ${totalElapsed}ms (${Math.round(totalElapsed/1000)}s)`);
           logger.info(`[getCaptcha] Số round đã giải: ${challengeRound}`);
           logger.info('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-          resolve(token);
+          resolve(token ?? null);
         } catch(err: any) {
           logger.error('[getCaptcha] ❌ Lỗi khi extract token từ intercepted request: ' + err.message);
           reject(err);
@@ -937,20 +999,22 @@ class SunoApi {
     const timeoutPromise = new Promise<string|null>((resolve) => {
       timeoutId = setTimeout(() => {
         const elapsed = Date.now() - captchaStartMs;
-        logger.warn(`[getCaptcha] ⏰ Timeout sau 2 phút (${elapsed}ms). Trả về null (graceful fallback).`);
+        logger.warn(`[getCaptcha] ⏰ Timeout sau 3 phút (${elapsed}ms). Trả về null (graceful fallback).`);
         try {
-          browser.browser()?.close();
+          browserCtx.browser()?.close();
           controller.abort();
         } catch {}
         resolve(null);
-      }, 120000);
+      }, 180000);
     });
 
     return Promise.race([tokenPromise, timeoutPromise]);
   }
 
   /**
-   * Imitates Cloudflare Turnstile loading error. Unused right now, left for future
+   * Imitates Cloudflare Turnstile loading error (unused, kept for reference).
+   * Previously used to bypass Turnstile by reporting it as broken — no longer needed
+   * since we now intercept the real Turnstile token from the generate/v2-web request.
    */
   private async getTurnstile() {
     return this.client.post(
@@ -1103,6 +1167,7 @@ class SunoApi {
     await this.keepAlive();
     // Generate browser-token (mimics Suno web client)
     const browserToken = Buffer.from(JSON.stringify({ timestamp: Date.now() })).toString('base64');
+    const captchaToken = await this.getCaptcha();
     const payload: any = {
       mv: model || DEFAULT_MODEL,
       make_instrumental: make_instrumental,
@@ -1111,7 +1176,7 @@ class SunoApi {
       continue_at: continue_at,
       continue_clip_id: continue_clip_id,
       task: task,
-      token: await this.getCaptcha(),
+      token: captchaToken,
       // Fields required by v2-web endpoint
       transaction_uuid: randomUUID(),
       override_fields: [],
