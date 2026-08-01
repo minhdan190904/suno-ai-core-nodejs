@@ -442,7 +442,7 @@ class SunoApi {
       logger.info('[getCaptcha] ✅ Không cần CAPTCHA, bỏ qua browser flow. Tổng thời gian: ' + (Date.now() - captchaStartMs) + 'ms');
       return null;
     }
-    logger.info('[getCaptcha] ⚠️  CAPTCHA BẮT BUỘC — Sẽ mở browser Playwright để giải hCaptcha...');
+    logger.info('[getCaptcha] ⚠️  CAPTCHA BẮT BUỘC — Sẽ mở browser Playwright để giải CAPTCHA...');
 
     logger.info('[getCaptcha] [2/6] Khởi động browser Playwright...');
     const browserLaunchStart = Date.now();
@@ -716,7 +716,7 @@ class SunoApi {
     const controller = new AbortController();
     const challengeStartMs = Date.now();
     logger.info('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-    logger.info('[getCaptcha] [10/10] 🤖 Bắt đầu vòng lặp giải hCaptcha (2Captcha)...');
+    logger.info('[getCaptcha] [10/10] 🤖 Bắt đầu vòng lặp giải CAPTCHA (2Captcha)...');
     logger.info('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
     let challengeRound = 0;
     let resolveTokenPromise: (value: string | null | PromiseLike<string | null>) => void;
