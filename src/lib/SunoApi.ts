@@ -784,11 +784,13 @@ class SunoApi {
           let tsUrl: string | null = null;
           try {
             const tsFrames = page.frames().filter(f => f.url().includes('challenges.cloudflare.com'));
+            // Lấy frame cuối cùng (Suno Create) thay vì frame đầu tiên (Clerk Auth)
             for (const f of tsFrames) {
-              if (f.url().match(/([0-9]x4[A-Za-z0-9_-]{15,})/)) {
+              const match = f.url().match(/([0-9]x4[A-Za-z0-9_-]{15,})/);
+              if (match) {
                 tsFrameObj = f;
                 tsUrl = f.url();
-                break;
+                // Không break để luôn lấy frame được thêm vào sau cùng
               }
             }
           } catch(e) {}
